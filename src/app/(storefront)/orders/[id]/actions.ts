@@ -92,8 +92,8 @@ export async function checkCustomerOrderPaymentStatus(
     }
   }
 
-  // 3. Background polls ONLY check Supabase during the first 90s (relying on the webhook + Realtime).
-  // Only run a single automatic Daraja fallback query at +90s if the webhook hasn't arrived.
+  // 3. Background polls check Supabase every 10s, and run an automatic Daraja
+  // reconciliation query at +30s, +65s, and +100s if the webhook hasn't arrived yet.
   if (!forceDarajaQuery) {
     const lastInitiatedIso = resolveLastStkInitiatedIso(
       order.payment_expires_at,
@@ -102,26 +102,26 @@ export async function checkCustomerOrderPaymentStatus(
     const shouldAutoQuery = shouldRunScheduledDarajaQuery(
       order.id,
       lastInitiatedIso,
-      90000,
-      60000
+      30000,
+      35000
     )
     if (!shouldAutoQuery) {
       return { order }
     }
   }
 
-  // 4. Rate limit manual Daraja stkpushquery to at most 1 call every 30 seconds per order
+  // 4. Rate limit Daraja stkpushquery to at most 1 call every 15 seconds per order
   const queryLimit = checkRateLimit(`stk_query_${order.id}`, {
-    maxRequests: 3,
+    maxRequests: 5,
     windowMs: 120 * 1000,
-    minIntervalMs: 30000,
+    minIntervalMs: 15000,
   })
 
   if (!queryLimit.allowed) {
     return {
       order,
       gatewayMessage: forceDarajaQuery
-        ? `Please wait ${queryLimit.retryAfterSeconds}s before querying Safaricom again (or wait for automatic webhook confirmation).`
+        ? `Please wait ${queryLimit.retryAfterSeconds}s before querying Safaricom again.`
         : undefined,
     }
   }

@@ -1,11 +1,18 @@
-const DARAJA_ENV = process.env.MPESA_ENV === 'production' ? 'production' : 'sandbox'
-const BASE_URL =
-  DARAJA_ENV === 'production'
-    ? 'https://api.safaricom.co.ke'
-    : 'https://sandbox.safaricom.co.ke'
+function getDarajaEnvConfig() {
+  const env = process.env.MPESA_ENV === 'production' ? 'production' : 'sandbox'
+  const baseUrl =
+    env === 'production'
+      ? 'https://api.safaricom.co.ke'
+      : 'https://sandbox.safaricom.co.ke'
+  const consumerKey = process.env.MPESA_CONSUMER_KEY?.trim() || ''
+  const consumerSecret = process.env.MPESA_CONSUMER_SECRET?.trim() || ''
+  const cacheKey = `${env}:${consumerKey.slice(0, 10)}`
+
+  return { env, baseUrl, consumerKey, consumerSecret, cacheKey }
+}
 
 interface DarajaGlobalCache {
-  cachedToken: { value: string; expiresAt: number } | null
+  cachedToken: { value: string; expiresAt: number; cacheKey: string } | null
   inFlightTokenPromise: Promise<string> | null
   lastApiCallAt: number
   backoffUntil: number
@@ -40,9 +47,6 @@ export function getDarajaBackoffRemainingSeconds(): number {
   return remainingMs > 0 ? Math.ceil(remainingMs / 1000) : 0
 }
 
-/**
- * Serializes outbound calls with a short minimum gap (2.2s) without sleeping for 35s+ backoffs
- */
 async function paceDarajaRequest(minGapMs = 2200): Promise<void> {
   const cache = getDarajaCache()
   const previousQueue =
@@ -105,7 +109,13 @@ export function getDarajaTimestamp(): string {
 
 export async function getDarajaAccessToken(forceRefresh = false): Promise<string> {
   const cache = getDarajaCache()
+  const { env, baseUrl, consumerKey, consumerSecret, cacheKey } = getDarajaEnvConfig()
   const now = Date.now()
+
+  if (cache.cachedToken && cache.cachedToken.cacheKey !== cacheKey) {
+    cache.cachedToken = null
+    cache.backoffUntil = 0
+  }
 
   if (!forceRefresh && cache.cachedToken && now < cache.cachedToken.expiresAt) {
     return cache.cachedToken.value
@@ -114,9 +124,6 @@ export async function getDarajaAccessToken(forceRefresh = false): Promise<string
   if (!forceRefresh && cache.inFlightTokenPromise) {
     return cache.inFlightTokenPromise
   }
-
-  const consumerKey = process.env.MPESA_CONSUMER_KEY?.trim()
-  const consumerSecret = process.env.MPESA_CONSUMER_SECRET?.trim()
 
   if (!consumerKey || !consumerSecret) {
     throw new Error(
@@ -131,7 +138,7 @@ export async function getDarajaAccessToken(forceRefresh = false): Promise<string
       await paceDarajaRequest(1500)
 
       const response = await fetch(
-        `${BASE_URL}/oauth/v1/generate?grant_type=client_credentials`,
+        `${baseUrl}/oauth/v1/generate?grant_type=client_credentials`,
         {
           method: 'GET',
           headers: {
@@ -145,7 +152,7 @@ export async function getDarajaAccessToken(forceRefresh = false): Promise<string
       if (!response.ok) {
         if (response.status === 401 || response.status === 400) {
           throw new Error(
-            `Daraja OAuth rejected credentials (HTTP ${response.status}). Ensure MPESA_ENV (${DARAJA_ENV}) matches your Consumer Key & Secret.`
+            `Daraja OAuth rejected credentials (HTTP ${response.status}). Ensure MPESA_ENV (${env}) matches your Consumer Key & Secret.`
           )
         }
         throw new Error(`Daraja OAuth failed with HTTP ${response.status}`)
@@ -157,6 +164,7 @@ export async function getDarajaAccessToken(forceRefresh = false): Promise<string
       cache.cachedToken = {
         value: data.access_token,
         expiresAt: Date.now() + ttlSeconds * 1000,
+        cacheKey,
       }
 
       return data.access_token
@@ -208,6 +216,7 @@ export async function initiateDarajaStkPush({
   orderNumber,
   description = 'LuminousDrip',
 }: InitiateStkPushParams): Promise<StkPushResponse> {
+  const { env, baseUrl } = getDarajaEnvConfig()
   const formattedPhone = normalizeKenyanPhone(phone)
   const shortcode = (process.env.MPESA_SHORTCODE || '174379').trim()
   const partyB = (process.env.MPESA_PARTY_B || shortcode).trim()
@@ -227,11 +236,12 @@ export async function initiateDarajaStkPush({
   const cleanDesc =
     description.replace(/[^a-zA-Z0-9]/g, '').slice(0, 12) || 'OrderPay'
 
-  const useFullSandboxAmount = process.env.MPESA_SANDBOX_USE_FULL_AMOUNT === 'true'
-  const billedAmount =
-    DARAJA_ENV === 'sandbox' && !useFullSandboxAmount
-      ? 1
-      : Math.max(1, Math.round(amount))
+  // Always send the exact order total unless MPESA_SANDBOX_FORCE_ONE_KES='true' is explicitly set
+  const forceOneKesInSandbox =
+    env === 'sandbox' && process.env.MPESA_SANDBOX_FORCE_ONE_KES === 'true'
+  const billedAmount = forceOneKesInSandbox
+    ? 1
+    : Math.max(1, Math.round(Number(amount) || 1))
 
   const token = await getDarajaAccessToken()
   await paceDarajaRequest(2200)
@@ -258,7 +268,7 @@ export async function initiateDarajaStkPush({
     Password: '[REDACTED]',
   })
 
-  const res = await fetch(`${BASE_URL}/mpesa/stkpush/v1/processrequest`, {
+  const res = await fetch(`${baseUrl}/mpesa/stkpush/v1/processrequest`, {
     method: 'POST',
     headers: {
       Authorization: `Bearer ${token}`,
@@ -307,17 +317,17 @@ export interface NormalizedDarajaQueryResult {
 export async function queryDarajaStkStatus(
   checkoutRequestId: string
 ): Promise<NormalizedDarajaQueryResult> {
-  // Fail-fast circuit breaker: never sleep inside a server action if Daraja is in a 429 cooldown
   const backoffSecs = getDarajaBackoffRemainingSeconds()
   if (backoffSecs > 0) {
     return {
       state: 'rate_limited',
       httpStatus: 429,
       resultCode: '429',
-      description: `Safaricom Sandbox query rate limit active. Please wait ${backoffSecs}s (or await automatic webhook confirmation).`,
+      description: `Safaricom query rate limit active. Please wait ${backoffSecs}s (or await automatic webhook confirmation).`,
     }
   }
 
+  const { baseUrl } = getDarajaEnvConfig()
   const shortcode = (process.env.MPESA_SHORTCODE || '174379').trim()
   const passkey = (
     process.env.MPESA_PASSKEY ||
@@ -325,7 +335,7 @@ export async function queryDarajaStkStatus(
   ).trim()
 
   const token = await getDarajaAccessToken()
-  await paceDarajaRequest(3000)
+  await paceDarajaRequest(2500)
 
   const timestamp = getDarajaTimestamp()
   const password = Buffer.from(`${shortcode}${passkey}${timestamp}`).toString('base64')
@@ -342,7 +352,7 @@ export async function queryDarajaStkStatus(
     Password: '[REDACTED]',
   })
 
-  const res = await fetch(`${BASE_URL}/mpesa/stkpushquery/v1/query`, {
+  const res = await fetch(`${baseUrl}/mpesa/stkpushquery/v1/query`, {
     method: 'POST',
     headers: {
       Authorization: `Bearer ${token}`,
@@ -363,46 +373,48 @@ export async function queryDarajaStkStatus(
 
   console.info(`[Daraja STK Query Response HTTP ${res.status}]`, data)
 
-  // 1. Explicit HTTP 429 Spike Arrest handling with 45s fail-fast circuit breaker
+  // 1. Explicit HTTP 429 Spike Arrest handling with 35s fail-fast circuit breaker
   const hasSpikeArrest =
     res.status === 429 ||
     Boolean((data.fault as Record<string, unknown> | undefined)?.faultstring)
 
   if (hasSpikeArrest) {
-    getDarajaCache().backoffUntil = Date.now() + 45000
+    getDarajaCache().backoffUntil = Date.now() + 35000
     return {
       state: 'rate_limited',
       httpStatus: res.status,
       resultCode: '429',
       description:
-        'Safaricom Sandbox query rate limit reached (HTTP 429 on shared shortcode 174379). Backing off for 45s while awaiting webhook callback.',
+        'Safaricom query rate limit reached (HTTP 429). Backing off for 35s while awaiting webhook callback.',
     }
   }
 
-  // 2. Explicit Upstream Error handling (e.g., 500.001.1001)
+  // 2. Explicit Upstream Error handling (e.g., 500.001.1001 while user is still entering PIN)
   const errorCode = data.errorCode ? String(data.errorCode) : null
   if (errorCode) {
-    // Also pause queries for 25s when 500.001.1001 is returned so we don't spam the upstream switch
-    getDarajaCache().backoffUntil = Date.now() + 25000
-    const errorMsg = data.errorMessage ? String(data.errorMessage) : 'Transaction still in progress on switch'
+    const errorMsg = data.errorMessage
+      ? String(data.errorMessage)
+      : 'Transaction still being processed on Safaricom switch'
     return {
       state: 'upstream_error',
       httpStatus: res.status,
       resultCode: errorCode,
-      description: `Safaricom switch status (${errorCode}): ${errorMsg}. Enter your M-Pesa PIN on your phone if prompted.`,
+      description: `Safaricom switch status (${errorCode}): ${errorMsg}. Complete PIN entry on your handset if prompted.`,
     }
   }
 
   // 3. Definitive Transaction ResultCodes
   const resultCodeStr =
-    data.ResultCode !== undefined ? String(data.ResultCode) : null
+    data.ResultCode !== undefined ? String(data.ResultCode).trim() : null
 
   if (resultCodeStr === '0') {
     return {
       state: 'succeeded',
       httpStatus: res.status,
       resultCode: '0',
-      description: String(data.ResultDesc || 'The service request is processed successfully.'),
+      description: String(
+        data.ResultDesc || 'The service request is processed successfully.'
+      ),
     }
   }
 
@@ -427,13 +439,44 @@ export async function queryDarajaStkStatus(
     }
   }
 
-  const otherFailureCodes = new Set(['1', '2001', '1025'])
-  if (resultCodeStr && otherFailureCodes.has(resultCodeStr)) {
+  if (resultCodeStr === '1') {
+    return {
+      state: 'failed',
+      httpStatus: res.status,
+      resultCode: '1',
+      description:
+        'Code 1 (Insufficient Balance): Your M-Pesa wallet balance is lower than the requested order amount.',
+    }
+  }
+
+  if (resultCodeStr === '2001') {
+    return {
+      state: 'failed',
+      httpStatus: res.status,
+      resultCode: '2001',
+      description: 'Code 2001: The M-Pesa PIN entered was invalid.',
+    }
+  }
+
+  if (resultCodeStr === '2029') {
+    return {
+      state: 'failed',
+      httpStatus: res.status,
+      resultCode: '2029',
+      description:
+        'Code 2029 (Unresolved Reason Type): TransactionType/PartyB mismatch for shortcode.',
+    }
+  }
+
+  // Any other non-zero ResultCode (except intermediate 4999) is a terminal failure
+  if (resultCodeStr && resultCodeStr !== '4999') {
     return {
       state: 'failed',
       httpStatus: res.status,
       resultCode: resultCodeStr,
-      description: String(data.ResultDesc || `Transaction failed (Code ${resultCodeStr}).`),
+      description: String(
+        data.ResultDesc || `Transaction failed (ResultCode ${resultCodeStr}).`
+      ),
     }
   }
 
