@@ -48,6 +48,7 @@ export default async function OrderStatusPage({
           initialPaymentStatus={order.payment_status}
           initialOrderStatus={order.order_status}
           initialPhone={order.customer_phone}
+          initialCheckoutRequestId={order.mpesa_checkout_request_id}
           initialReceipt={order.mpesa_receipt_number}
           initialResultDesc={order.mpesa_result_desc}
           initialExpiresAt={

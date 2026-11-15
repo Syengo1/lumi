@@ -67,7 +67,7 @@ export async function updateOrderStatus(orderId: string, nextStatus: OrderStatus
 export async function manualVerifyMpesaReceipt(orderId: string, receiptCode: string) {
   const { supabase, storeId } = await requireStoreAdmin()
 
-  const formattedReceipt = receiptCode.trim().toUpperCase()
+  const formattedReceipt = receiptCode.trim().toUpperCase().replace(/[^A-Z0-9]/g, '')
   if (!formattedReceipt || formattedReceipt.length < 6) {
     throw new Error('Please enter a valid M-Pesa Receipt Number (e.g., SJK8912XYZ).')
   }
@@ -83,16 +83,21 @@ export async function manualVerifyMpesaReceipt(orderId: string, receiptCode: str
     throw new Error('Order not found.')
   }
 
-  const { error: rpcError } = await supabase.rpc('finalize_order_mpesa_payment', {
-    target_order_id: existingOrder.id,
-    checkout_req_id: existingOrder.mpesa_checkout_request_id,
-    result_code: 0,
-    result_desc: 'Manually verified by store administrator',
-    receipt_num: formattedReceipt,
-  })
+  const { data: finalizedId, error: rpcError } = await supabase.rpc(
+    'finalize_order_mpesa_payment',
+    {
+      target_order_id: existingOrder.id,
+      checkout_req_id: existingOrder.mpesa_checkout_request_id,
+      result_code: 0,
+      result_desc: 'Manually verified by store administrator',
+      receipt_num: formattedReceipt,
+    }
+  )
 
-  if (rpcError) {
-    throw new Error(`Failed to record M-Pesa receipt: ${rpcError.message}`)
+  if (rpcError || !finalizedId) {
+    throw new Error(
+      `Failed to record M-Pesa receipt: ${rpcError?.message || 'Order update failed'}`
+    )
   }
 
   revalidateOrderPaths(orderId)
@@ -119,8 +124,8 @@ export async function syncOrderMpesaStatus(orderId: string) {
   try {
     const darajaStatus = await queryDarajaStkStatus(order.mpesa_checkout_request_id)
 
-    if (darajaStatus.state === 'paid') {
-      await supabase.rpc('finalize_order_mpesa_payment', {
+    if (darajaStatus.state === 'succeeded') {
+      const { error: rpcError } = await supabase.rpc('finalize_order_mpesa_payment', {
         target_order_id: order.id,
         checkout_req_id: order.mpesa_checkout_request_id,
         result_code: 0,
@@ -128,11 +133,19 @@ export async function syncOrderMpesaStatus(orderId: string) {
         receipt_num: null,
       })
 
+      if (rpcError) {
+        return { error: `Payment confirmed, but DB update failed: ${rpcError.message}` }
+      }
+
       revalidateOrderPaths(orderId)
       return { success: true, message: 'M-Pesa payment confirmed via Daraja!' }
     }
 
-    if (darajaStatus.state === 'failed') {
+    if (
+      darajaStatus.state === 'failed' ||
+      darajaStatus.state === 'cancelled' ||
+      darajaStatus.state === 'timed_out'
+    ) {
       await supabase.rpc('finalize_order_mpesa_payment', {
         target_order_id: order.id,
         checkout_req_id: order.mpesa_checkout_request_id,
@@ -145,6 +158,7 @@ export async function syncOrderMpesaStatus(orderId: string) {
       return { error: darajaStatus.description }
     }
 
+    // For 'pending', 'rate_limited', or 'upstream_error', log the latest status description without failing the order
     await supabase
       .from('orders')
       .update({

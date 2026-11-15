@@ -45,23 +45,72 @@ CREATE EXTENSION IF NOT EXISTS "uuid-ossp" WITH SCHEMA "extensions";
 
 
 
-CREATE OR REPLACE FUNCTION "public"."attach_order_stk_request"("target_order_id" "uuid", "target_store_id" "uuid", "checkout_req_id" "text", "merchant_req_id" "text", "result_desc" "text", "updated_phone" "text" DEFAULT NULL::"text") RETURNS "void"
+CREATE OR REPLACE FUNCTION "public"."attach_order_stk_request"("target_order_id" "uuid", "target_store_id" "uuid", "checkout_req_id" "text", "merchant_req_id" "text", "result_desc" "text", "updated_phone" "text" DEFAULT NULL::"text") RETURNS boolean
     LANGUAGE "plpgsql" SECURITY DEFINER
     SET "search_path" TO 'public'
     AS $$
+DECLARE
+  v_order public.orders%ROWTYPE;
+  v_attempt_status text;
 BEGIN
+  SELECT * INTO v_order
+  FROM public.orders
+  WHERE id = target_order_id
+    AND store_id = target_store_id
+    AND payment_status != 'paid'
+  FOR UPDATE;
+
+  IF NOT FOUND THEN
+    RETURN false;
+  END IF;
+
+  v_attempt_status := CASE
+    WHEN checkout_req_id IS NOT NULL AND length(trim(checkout_req_id)) > 0 THEN 'pending'
+    ELSE 'failed'
+  END;
+
+  -- Record the individual payment attempt
+  INSERT INTO public.payment_attempts (
+    store_id,
+    order_id,
+    merchant_request_id,
+    checkout_request_id,
+    phone_number,
+    amount,
+    status,
+    result_description,
+    completed_at
+  ) VALUES (
+    target_store_id,
+    target_order_id,
+    merchant_req_id,
+    checkout_req_id,
+    COALESCE(updated_phone, v_order.customer_phone),
+    v_order.total_amount,
+    v_attempt_status,
+    result_desc,
+    CASE WHEN v_attempt_status = 'failed' THEN timezone('utc'::text, now()) ELSE NULL END
+  )
+  ON CONFLICT (checkout_request_id) DO UPDATE
+  SET
+    merchant_request_id = EXCLUDED.merchant_request_id,
+    result_description = EXCLUDED.result_description,
+    status = EXCLUDED.status;
+
+  -- Sync the active reference onto the parent order without overwriting a valid CheckoutRequestID with NULL
   UPDATE public.orders
   SET
-    mpesa_checkout_request_id = checkout_req_id,
-    mpesa_merchant_request_id = merchant_req_id,
+    mpesa_checkout_request_id = COALESCE(checkout_req_id, mpesa_checkout_request_id),
+    mpesa_merchant_request_id = COALESCE(merchant_req_id, mpesa_merchant_request_id),
     mpesa_result_desc = result_desc,
     customer_phone = COALESCE(updated_phone, customer_phone),
     payment_status = 'pending',
     order_status = CASE WHEN order_status = 'cancelled' THEN 'pending' ELSE order_status END,
     payment_expires_at = timezone('utc'::text, now()) + interval '120 seconds'
   WHERE id = target_order_id
-    AND store_id = target_store_id
-    AND payment_status != 'paid';
+    AND store_id = target_store_id;
+
+  RETURN true;
 END;
 $$;
 
@@ -125,8 +174,8 @@ DECLARE
   v_item RECORD;
   v_prod RECORD;
   v_new_variants jsonb;
+  v_mapped_attempt_status text;
 BEGIN
-  -- Locate order either by explicit ID or by Daraja CheckoutRequestID
   SELECT * INTO v_order
   FROM public.orders
   WHERE (target_order_id IS NOT NULL AND id = target_order_id)
@@ -137,7 +186,28 @@ BEGIN
     RETURN NULL;
   END IF;
 
-  -- If already paid, idempotently return the order ID without double-deducting stock
+  -- Map Daraja ResultCode to explicit payment_attempts status
+  v_mapped_attempt_status := CASE
+    WHEN result_code = 0 THEN 'succeeded'
+    WHEN result_code = 1032 THEN 'cancelled'
+    WHEN result_code IN (1037, 1019) THEN 'timed_out'
+    ELSE 'failed'
+  END;
+
+  -- Update the matching payment_attempts row
+  IF checkout_req_id IS NOT NULL THEN
+    UPDATE public.payment_attempts
+    SET
+      status = v_mapped_attempt_status,
+      result_code = result_code,
+      result_description = result_desc,
+      mpesa_receipt_number = COALESCE(receipt_num, mpesa_receipt_number),
+      completed_at = COALESCE(completed_at, timezone('utc'::text, now()))
+    WHERE checkout_request_id = checkout_req_id
+      AND order_id = v_order.id;
+  END IF;
+
+  -- Idempotency guard: if order is already paid, never deduct stock a second time
   IF v_order.payment_status = 'paid' THEN
     RETURN v_order.id;
   END IF;
@@ -146,13 +216,13 @@ BEGIN
     UPDATE public.orders
     SET
       payment_status = 'paid',
-      order_status = CASE WHEN order_status = 'pending' OR order_status = 'cancelled' THEN 'confirmed' ELSE order_status END,
-      mpesa_receipt_number = COALESCE(receipt_num, mpesa_receipt_number, 'MPESA-PAID'),
+      order_status = CASE WHEN order_status IN ('pending', 'cancelled') THEN 'confirmed' ELSE order_status END,
+      mpesa_receipt_number = COALESCE(receipt_num, mpesa_receipt_number),
       mpesa_result_desc = result_desc,
       paid_at = timezone('utc'::text, now())
     WHERE id = v_order.id;
 
-    -- Atomically decrement stock_count and per-size variant stock
+    -- Atomically deduct stock once
     FOR v_item IN
       SELECT product_id, selected_size, quantity
       FROM public.order_items
@@ -318,6 +388,28 @@ CREATE TABLE IF NOT EXISTS "public"."orders" (
 ALTER TABLE "public"."orders" OWNER TO "postgres";
 
 
+CREATE TABLE IF NOT EXISTS "public"."payment_attempts" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "store_id" "uuid" NOT NULL,
+    "order_id" "uuid" NOT NULL,
+    "merchant_request_id" "text",
+    "checkout_request_id" "text",
+    "phone_number" "text" NOT NULL,
+    "amount" numeric(10,2) NOT NULL,
+    "status" "text" DEFAULT 'initiating'::"text" NOT NULL,
+    "result_code" integer,
+    "result_description" "text",
+    "mpesa_receipt_number" "text",
+    "raw_callback_payload" "jsonb",
+    "created_at" timestamp with time zone DEFAULT "timezone"('utc'::"text", "now"()) NOT NULL,
+    "completed_at" timestamp with time zone,
+    CONSTRAINT "payment_attempts_status_check" CHECK (("status" = ANY (ARRAY['initiating'::"text", 'pending'::"text", 'succeeded'::"text", 'failed'::"text", 'cancelled'::"text", 'timed_out'::"text"])))
+);
+
+
+ALTER TABLE "public"."payment_attempts" OWNER TO "postgres";
+
+
 CREATE TABLE IF NOT EXISTS "public"."products" (
     "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
     "category_id" "uuid",
@@ -407,6 +499,16 @@ ALTER TABLE ONLY "public"."orders"
 
 
 
+ALTER TABLE ONLY "public"."payment_attempts"
+    ADD CONSTRAINT "payment_attempts_checkout_request_id_key" UNIQUE ("checkout_request_id");
+
+
+
+ALTER TABLE ONLY "public"."payment_attempts"
+    ADD CONSTRAINT "payment_attempts_pkey" PRIMARY KEY ("id");
+
+
+
 ALTER TABLE ONLY "public"."products"
     ADD CONSTRAINT "products_pkey" PRIMARY KEY ("id");
 
@@ -440,6 +542,14 @@ CREATE INDEX "idx_orders_checkout_req" ON "public"."orders" USING "btree" ("mpes
 
 
 CREATE INDEX "idx_orders_store_id" ON "public"."orders" USING "btree" ("store_id", "created_at" DESC);
+
+
+
+CREATE INDEX "idx_payment_attempts_checkout_req" ON "public"."payment_attempts" USING "btree" ("checkout_request_id");
+
+
+
+CREATE INDEX "idx_payment_attempts_order_id" ON "public"."payment_attempts" USING "btree" ("order_id", "created_at" DESC);
 
 
 
@@ -488,6 +598,16 @@ ALTER TABLE ONLY "public"."orders"
 
 
 
+ALTER TABLE ONLY "public"."payment_attempts"
+    ADD CONSTRAINT "payment_attempts_order_id_fkey" FOREIGN KEY ("order_id") REFERENCES "public"."orders"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."payment_attempts"
+    ADD CONSTRAINT "payment_attempts_store_id_fkey" FOREIGN KEY ("store_id") REFERENCES "public"."stores"("id") ON DELETE CASCADE;
+
+
+
 ALTER TABLE ONLY "public"."products"
     ADD CONSTRAINT "products_category_id_fkey" FOREIGN KEY ("category_id") REFERENCES "public"."categories"("id") ON DELETE SET NULL;
 
@@ -516,6 +636,10 @@ CREATE POLICY "Anyone in store context can view order status" ON "public"."order
 
 
 
+CREATE POLICY "Anyone in store context can view payment attempts" ON "public"."payment_attempts" FOR SELECT TO "authenticated", "anon" USING ((("store_id" = "public"."requested_store_id"()) OR "public"."is_store_admin"("store_id")));
+
+
+
 CREATE POLICY "Customers can create orders for active store" ON "public"."orders" FOR INSERT TO "authenticated", "anon" WITH CHECK (("store_id" = "public"."requested_store_id"()));
 
 
@@ -537,6 +661,10 @@ CREATE POLICY "Store admins can manage own orders" ON "public"."orders" TO "auth
 
 
 CREATE POLICY "Store admins can manage own products" ON "public"."products" TO "authenticated" USING ("public"."is_store_admin"("store_id")) WITH CHECK ("public"."is_store_admin"("store_id"));
+
+
+
+CREATE POLICY "Store admins can manage payment attempts" ON "public"."payment_attempts" TO "authenticated" USING ("public"."is_store_admin"("store_id")) WITH CHECK ("public"."is_store_admin"("store_id"));
 
 
 
@@ -577,6 +705,9 @@ ALTER TABLE "public"."order_items" ENABLE ROW LEVEL SECURITY;
 ALTER TABLE "public"."orders" ENABLE ROW LEVEL SECURITY;
 
 
+ALTER TABLE "public"."payment_attempts" ENABLE ROW LEVEL SECURITY;
+
+
 ALTER TABLE "public"."products" ENABLE ROW LEVEL SECURITY;
 
 
@@ -589,6 +720,14 @@ ALTER TABLE "public"."user_roles" ENABLE ROW LEVEL SECURITY;
 
 
 ALTER PUBLICATION "supabase_realtime" OWNER TO "postgres";
+
+
+
+
+
+
+ALTER PUBLICATION "supabase_realtime" ADD TABLE ONLY "public"."orders";
+
 
 
 GRANT USAGE ON SCHEMA "public" TO "postgres";
@@ -811,6 +950,12 @@ GRANT SELECT,INSERT ON TABLE "public"."order_items" TO "anon";
 GRANT ALL ON TABLE "public"."orders" TO "authenticated";
 GRANT ALL ON TABLE "public"."orders" TO "service_role";
 GRANT SELECT,INSERT ON TABLE "public"."orders" TO "anon";
+
+
+
+GRANT ALL ON TABLE "public"."payment_attempts" TO "anon";
+GRANT ALL ON TABLE "public"."payment_attempts" TO "authenticated";
+GRANT ALL ON TABLE "public"."payment_attempts" TO "service_role";
 
 
 
