@@ -1,5 +1,6 @@
 import { createClient } from '@/lib/supabase/server'
 import { getStoreId } from '@/lib/supabase/config'
+import { SHOP_LOCATION } from '@/lib/geo/haversine'
 import { OrdersClientView } from '@/components/orders/orders-client-view'
 import type { OrderItemRecord, OrderRecord, StoreOriginInfo } from '@/lib/orders/types'
 import { connection } from 'next/server'
@@ -8,7 +9,6 @@ export const instant = false
 
 export default async function AdminOrdersPage() {
   await connection()
-
   const supabase = await createClient()
   const storeId = getStoreId()
 
@@ -33,12 +33,11 @@ export default async function AdminOrdersPage() {
       .eq('store_id', storeId),
     supabase
       .from('stores')
-      .select('name, origin_address, origin_lat, origin_lng')
+      .select('name')
       .eq('id', storeId)
       .maybeSingle(),
   ])
 
-  // Group order_items by order_id
   const itemsByOrderId = new Map<string, OrderItemRecord[]>()
   for (const item of (orderItemsData as OrderItemRecord[]) || []) {
     const existing = itemsByOrderId.get(item.order_id) || []
@@ -46,7 +45,6 @@ export default async function AdminOrdersPage() {
     itemsByOrderId.set(item.order_id, existing)
   }
 
-  // Merge orders with their line items
   const enrichedOrders: OrderRecord[] = ((ordersData as Omit<OrderRecord, 'items'>[]) || []).map(
     (order) => ({
       ...order,
@@ -54,7 +52,6 @@ export default async function AdminOrdersPage() {
     })
   )
 
-  // Map product_id -> buy_price for live net profit calculations
   const productCostMap: Record<string, number> = {}
   for (const prod of productsData || []) {
     productCostMap[prod.id] = Number(prod.buy_price) || 0
@@ -62,9 +59,9 @@ export default async function AdminOrdersPage() {
 
   const storeOrigin: StoreOriginInfo = {
     name: storeData?.name || 'Luminous Drip Line',
-    origin_address: storeData?.origin_address || 'Nairobi CBD, Kenya',
-    origin_lat: Number(storeData?.origin_lat ?? -1.286389),
-    origin_lng: Number(storeData?.origin_lng ?? 36.817223),
+    origin_address: SHOP_LOCATION.name,
+    origin_lat: Number(SHOP_LOCATION.lat),
+    origin_lng: Number(SHOP_LOCATION.lng),
   }
 
   return (

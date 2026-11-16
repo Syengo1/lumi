@@ -6,6 +6,7 @@ import { Input } from '@/components/ui/input'
 import { Button } from '@/components/ui/button'
 import { Palette, Mail, Sparkles, Store, MapPin, Truck } from 'lucide-react'
 import { connection } from 'next/server'
+import { SHOP_LOCATION } from '@/lib/geo/haversine'
 
 export const instant = false
 
@@ -131,35 +132,33 @@ export default async function SettingsPage() {
               <div className="sm:col-span-1 space-y-2">
                 <label className="text-sm font-semibold ml-1 inline-flex items-center gap-1.5">
                   <MapPin size={15} className="text-primary" />
-                  Dispatch Hub Name
+                  Shop Location Name
                 </label>
                 <Input
                   name="origin_address"
-                  defaultValue={store?.origin_address || 'Nairobi CBD, Kenya'}
+                  defaultValue={SHOP_LOCATION.name}
                   required
                   className={inputAesthetic}
                 />
               </div>
-
               <div className="space-y-2">
-                <label className="text-sm font-semibold ml-1">Hub Latitude</label>
+                <label className="text-sm font-semibold ml-1">Shop Latitude</label>
                 <Input
                   type="number"
                   step="any"
                   name="origin_lat"
-                  defaultValue={store?.origin_lat ?? -1.286389}
+                  defaultValue={SHOP_LOCATION.lat}
                   required
                   className={inputAesthetic}
                 />
               </div>
-
               <div className="space-y-2">
-                <label className="text-sm font-semibold ml-1">Hub Longitude</label>
+                <label className="text-sm font-semibold ml-1">Shop Longitude</label>
                 <Input
                   type="number"
                   step="any"
                   name="origin_lng"
-                  defaultValue={store?.origin_lng ?? 36.817223}
+                  defaultValue={SHOP_LOCATION.lng}
                   required
                   className={inputAesthetic}
                 />

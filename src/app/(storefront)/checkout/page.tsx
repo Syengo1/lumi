@@ -4,9 +4,22 @@ import { useState, useMemo, useEffect } from 'react'
 import { useRouter } from 'next/navigation'
 import { useCart } from '@/components/store/cart-context'
 import { GoogleMapPicker } from '@/components/store/google-map-picker'
-import { calculateDeliveryQuote } from '@/lib/geo/haversine'
-import { processOrderAndInitiateMpesa, getPublicStoreDeliveryConfig } from './actions'
-import { Card, CardContent, CardHeader, CardTitle, CardDescription } from '@/components/ui/card'
+import {
+  SHOP_LOCATION,
+  DELIVERY_TIERS,
+  calculateDeliveryQuote,
+} from '@/lib/geo/haversine'
+import {
+  processOrderAndInitiateMpesa,
+  getPublicStoreDeliveryConfig,
+} from './actions'
+import {
+  Card,
+  CardContent,
+  CardHeader,
+  CardTitle,
+  CardDescription,
+} from '@/components/ui/card'
 import { Input } from '@/components/ui/input'
 import { Textarea } from '@/components/ui/textarea'
 import { Button } from '@/components/ui/button'
@@ -20,17 +33,28 @@ import {
   ArrowLeft,
   Loader2,
   MapPin,
+  Sparkles,
 } from 'lucide-react'
 
+interface CheckoutStoreConfig {
+  origin_address: string
+  origin_lat: number
+  origin_lng: number
+  base_delivery_fee: number
+  delivery_fee_per_km: number
+  min_delivery_fee: number
+  max_delivery_fee: number
+  free_delivery_threshold: number
+}
 
-
-const DEFAULT_STORE_CONFIG = {
-  origin_lat: -1.286389,
-  origin_lng: 36.817223,
+const DEFAULT_STORE_CONFIG: CheckoutStoreConfig = {
+  origin_address: SHOP_LOCATION.name,
+  origin_lat: Number(SHOP_LOCATION.lat),
+  origin_lng: Number(SHOP_LOCATION.lng),
   base_delivery_fee: 150,
   delivery_fee_per_km: 35,
-  min_delivery_fee: 200,
-  max_delivery_fee: 1500,
+  min_delivery_fee: 150,
+  max_delivery_fee: 1000,
   free_delivery_threshold: 15000,
 }
 
@@ -42,40 +66,106 @@ export default function CheckoutPage() {
   const [customerPhone, setCustomerPhone] = useState('')
   const [customerEmail, setCustomerEmail] = useState('')
   const [deliveryMethod, setDeliveryMethod] = useState<'delivery' | 'pickup'>('delivery')
-  const [deliveryAddress, setDeliveryAddress] = useState('Westlands, Nairobi')
+  const [deliveryAddress, setDeliveryAddress] = useState('')
   const [deliveryApartment, setDeliveryApartment] = useState('')
   const [deliveryNotes, setDeliveryNotes] = useState('')
-  const [coords, setCoords] = useState({ lat: -1.2683, lng: 36.8111 })
-
+  const [coords, setCoords] = useState<{ lat: number; lng: number }>({
+    lat: Number(SHOP_LOCATION.lat),
+    lng: Number(SHOP_LOCATION.lng),
+  })
+  const [hasSelectedLocation, setHasSelectedLocation] = useState(false)
   const [isSubmitting, setIsSubmitting] = useState(false)
   const [error, setError] = useState<string | null>(null)
-
-  const [storeConfig, setStoreConfig] = useState(DEFAULT_STORE_CONFIG)
+  const [storeConfig, setStoreConfig] = useState<CheckoutStoreConfig>(DEFAULT_STORE_CONFIG)
 
   useEffect(() => {
     let active = true
     getPublicStoreDeliveryConfig().then((cfg) => {
-      if (active && cfg) setStoreConfig(cfg)
+      if (active && cfg) {
+        setStoreConfig({
+          origin_address: String(cfg.origin_address || SHOP_LOCATION.name),
+          origin_lat: Number(SHOP_LOCATION.lat),
+          origin_lng: Number(SHOP_LOCATION.lng),
+          base_delivery_fee: Number(cfg.base_delivery_fee ?? 150),
+          delivery_fee_per_km: Number(cfg.delivery_fee_per_km ?? 35),
+          min_delivery_fee: Number(cfg.min_delivery_fee ?? 150),
+          max_delivery_fee: Number(cfg.max_delivery_fee ?? 1000),
+          free_delivery_threshold: Number(cfg.free_delivery_threshold ?? 15000),
+        })
+      }
     })
     return () => {
       active = false
     }
   }, [])
 
+  // If the customer types an address directly into the street/landmark input without
+  // clicking the map/search dropdown first, automatically geocode it to get coordinates
+  useEffect(() => {
+    if (deliveryMethod !== 'delivery' || hasSelectedLocation) return
+    const q = deliveryAddress.trim()
+    if (q.length < 4) return
+
+    const controller = new AbortController()
+    const timer = setTimeout(async () => {
+      try {
+        const res = await fetch(
+          `https://nominatim.openstreetmap.org/search?format=json&countrycodes=ke&limit=1&q=${encodeURIComponent(
+            q
+          )}`,
+          {
+            headers: { Accept: 'application/json' },
+            signal: controller.signal,
+          }
+        )
+        if (!res.ok) return
+        const data = (await res.json()) as Array<{ lat: string; lon: string }>
+        if (data[0]) {
+          const lat = Number(parseFloat(data[0].lat).toFixed(6))
+          const lng = Number(parseFloat(data[0].lon).toFixed(6))
+          if (Number.isFinite(lat) && Number.isFinite(lng)) {
+            setCoords({ lat, lng })
+            setHasSelectedLocation(true)
+          }
+        }
+      } catch {
+        // Ignore abort/network errors
+      }
+    }, 600)
+
+    return () => {
+      clearTimeout(timer)
+      controller.abort()
+    }
+  }, [deliveryAddress, deliveryMethod, hasSelectedLocation])
+
   const quote = useMemo(() => {
-    return calculateDeliveryQuote(
-      coords,
-      subtotal,
-      storeConfig,
-      deliveryMethod
-    )
-  }, [coords, subtotal, storeConfig, deliveryMethod])
+    if (deliveryMethod === 'pickup') {
+      return calculateDeliveryQuote(coords, subtotal, storeConfig, 'pickup')
+    }
+    if (!hasSelectedLocation) {
+      return {
+        distanceKm: 0,
+        deliveryFeeKes: 0,
+        deliveryFeeCents: 0,
+        isFreeDelivery: true,
+        tier: DELIVERY_TIERS[0],
+      }
+    }
+    return calculateDeliveryQuote(coords, subtotal, storeConfig, 'delivery')
+  }, [coords, subtotal, storeConfig, deliveryMethod, hasSelectedLocation])
 
   const grandTotal = subtotal + quote.deliveryFeeKes
 
   const handleCheckoutSubmit = async (e: React.FormEvent) => {
     e.preventDefault()
     setError(null)
+
+    if (deliveryMethod === 'delivery' && !deliveryAddress.trim()) {
+      setError('Please search or enter your delivery location.')
+      return
+    }
+
     setIsSubmitting(true)
 
     try {
@@ -85,15 +175,18 @@ export default function CheckoutPage() {
         customerEmail,
         deliveryMethod,
         deliveryAddress:
-          deliveryMethod === 'pickup' ? 'Store Pickup (Nairobi CBD)' : deliveryAddress,
+          deliveryMethod === 'pickup' ? 'Shop Pickup' : deliveryAddress,
         deliveryApartment,
         deliveryNotes,
-        deliveryLat: coords.lat,
-        deliveryLng: coords.lng,
+        deliveryLat:
+          deliveryMethod === 'pickup' ? Number(SHOP_LOCATION.lat) : coords.lat,
+        deliveryLng:
+          deliveryMethod === 'pickup' ? Number(SHOP_LOCATION.lng) : coords.lng,
         items: items.map((i) => ({
           productId: i.productId,
           selectedSize: i.selectedSize,
           quantity: i.quantity,
+          variantId: i.key,
         })),
       })
 
@@ -139,16 +232,17 @@ export default function CheckoutPage() {
 
       <form onSubmit={handleCheckoutSubmit}>
         <div className="grid grid-cols-1 lg:grid-cols-12 gap-8 items-start">
-          {/* LEFT 7 COLUMNS: Customer, Delivery Method, Google Map & Address */}
+          {/* LEFT 7 COLUMNS: Contact, Location Search, Live GPS & Delivery Tiers */}
           <div className="lg:col-span-7 space-y-6">
             <Card className="border-none shadow-[0_8px_30px_rgb(0,0,0,0.04)] bg-card rounded-2xl">
               <CardHeader className="px-7 pt-7 pb-4">
-                <CardTitle className="text-lg font-bold">1. Contact & M-Pesa Number</CardTitle>
+                <CardTitle className="text-lg font-bold">
+                  1. Contact &amp; M-Pesa Number
+                </CardTitle>
                 <CardDescription>
                   We will send the Safaricom M-Pesa STK Push prompt directly to this phone number.
                 </CardDescription>
               </CardHeader>
-
               <CardContent className="px-7 pb-7 space-y-4">
                 {error && (
                   <div className="p-3.5 rounded-xl bg-destructive/10 text-destructive text-sm font-semibold">
@@ -167,9 +261,10 @@ export default function CheckoutPage() {
                       className={inputStyle}
                     />
                   </div>
-
                   <div className="space-y-1.5">
-                    <label className="text-xs font-bold ml-1">M-Pesa Phone Number *</label>
+                    <label className="text-xs font-bold ml-1">
+                      M-Pesa Phone Number *
+                    </label>
                     <Input
                       required
                       value={customerPhone}
@@ -181,7 +276,9 @@ export default function CheckoutPage() {
                 </div>
 
                 <div className="space-y-1.5">
-                  <label className="text-xs font-bold ml-1">Email Address (Optional for Receipt)</label>
+                  <label className="text-xs font-bold ml-1">
+                    Email Address (Optional for Receipt)
+                  </label>
                   <Input
                     type="email"
                     value={customerEmail}
@@ -193,15 +290,16 @@ export default function CheckoutPage() {
               </CardContent>
             </Card>
 
-            {/* Delivery vs Pickup + Google Maps Pin + Haversine */}
+            {/* Delivery vs Pickup + Location Search + Live GPS + Tiered Pricing */}
             <Card className="border-none shadow-[0_8px_30px_rgb(0,0,0,0.04)] bg-card rounded-2xl">
               <CardHeader className="px-7 pt-7 pb-4">
-                <CardTitle className="text-lg font-bold">2. Delivery Location & GPS Pin</CardTitle>
+                <CardTitle className="text-lg font-bold">
+                  2. Delivery Location
+                </CardTitle>
                 <CardDescription>
-                  Delivery fee is calculated via Haversine distance from our Nairobi CBD dispatch hub.
+                  Delivery within 10 km of our shop is FREE. Search your location or use your live GPS below.
                 </CardDescription>
               </CardHeader>
-
               <CardContent className="px-7 pb-7 space-y-6">
                 <div className="grid grid-cols-2 gap-3">
                   <button
@@ -216,7 +314,9 @@ export default function CheckoutPage() {
                     <Truck size={20} />
                     <div>
                       <p className="font-bold text-sm">Doorstep Delivery</p>
-                      <p className="text-[11px] opacity-80">Rider dispatched to your pin</p>
+                      <p className="text-[11px] opacity-80">
+                        Free within 10 km of shop
+                      </p>
                     </div>
                   </button>
 
@@ -231,8 +331,10 @@ export default function CheckoutPage() {
                   >
                     <Store size={20} />
                     <div>
-                      <p className="font-bold text-sm">Store Pickup (Free)</p>
-                      <p className="text-[11px] opacity-80">Collect at Nairobi CBD</p>
+                      <p className="font-bold text-sm">Shop Pickup (Free)</p>
+                      <p className="text-[11px] opacity-80">
+                        Collect directly at the shop
+                      </p>
                     </div>
                   </button>
                 </div>
@@ -241,41 +343,76 @@ export default function CheckoutPage() {
                   <>
                     <GoogleMapPicker
                       coords={coords}
-                      originCoords={{
-                        lat: DEFAULT_STORE_CONFIG.origin_lat,
-                        lng: DEFAULT_STORE_CONFIG.origin_lng,
-                      }}
-                      onChange={(nextCoords, zoneLabel) => {
+                      hasSelectedLocation={hasSelectedLocation}
+                      onChange={(nextCoords, resolvedAddress) => {
                         setCoords(nextCoords)
-                        if (zoneLabel) setDeliveryAddress(zoneLabel)
+                        setHasSelectedLocation(true)
+                        if (resolvedAddress) {
+                          setDeliveryAddress(resolvedAddress)
+                        }
                       }}
                     />
 
-                    <div className="p-3.5 rounded-xl bg-primary/10 text-primary flex items-center justify-between text-xs font-bold">
-                      <span className="flex items-center gap-1.5">
-                        <MapPin size={15} /> Haversine Distance: {quote.distanceKm} km from Dispatch
-                      </span>
-                      <span>
-                        {quote.isFreeDelivery
-                          ? 'FREE DELIVERY'
-                          : `Delivery Fee: KES ${quote.deliveryFeeKes.toLocaleString()}`}
-                      </span>
+                    {/* Delivery Pricing Tier Strip */}
+                    <div className="p-4 rounded-2xl bg-primary/10 text-primary space-y-2.5">
+                      <div className="flex flex-wrap items-center justify-between gap-2 text-xs font-extrabold">
+                        <span className="flex items-center gap-1.5">
+                          <MapPin size={15} />
+                          {hasSelectedLocation
+                            ? `Delivery Distance: ${quote.distanceKm} km (${quote.tier.label})`
+                            : 'Select your delivery location above to calculate exact distance'}
+                        </span>
+                        {hasSelectedLocation && (
+                          <span className="px-2.5 py-0.5 rounded-full bg-primary text-primary-foreground">
+                            {quote.isFreeDelivery
+                              ? 'FREE DELIVERY'
+                              : `KES ${quote.deliveryFeeKes.toLocaleString()}`}
+                          </span>
+                        )}
+                      </div>
+
+                      <div className="grid grid-cols-5 gap-1.5 pt-1">
+                        {DELIVERY_TIERS.map((tier) => {
+                          const isCurrent =
+                            hasSelectedLocation && quote.tier.id === tier.id
+                          return (
+                            <div
+                              key={tier.id}
+                              className={`p-2 rounded-xl text-center transition-all ${
+                                isCurrent
+                                  ? 'bg-card text-foreground ring-2 ring-primary shadow-2xs'
+                                  : 'bg-card/50 text-muted-foreground opacity-75'
+                              }`}
+                            >
+                              <p className="text-[10px] font-bold truncate">
+                                {tier.rangeLabel}
+                              </p>
+                              <p className="text-xs font-extrabold text-primary mt-0.5">
+                                {tier.feeKes === 0 ? 'FREE' : `KES ${tier.feeKes}`}
+                              </p>
+                            </div>
+                          )
+                        })}
+                      </div>
                     </div>
 
                     <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
                       <div className="space-y-1.5">
-                        <label className="text-xs font-bold ml-1">Street / Estate / Landmark *</label>
+                        <label className="text-xs font-bold ml-1">
+                          Delivery Street / Estate / Landmark *
+                        </label>
                         <Input
                           required
                           value={deliveryAddress}
                           onChange={(e) => setDeliveryAddress(e.target.value)}
-                          placeholder="e.g. Ring Road Kilimani, near Yaya"
+                          placeholder="Enter your street, estate, or landmark"
                           className={inputStyle}
                         />
                       </div>
-
                       <div className="space-y-1.5">
-                        <label className="text-xs font-bold ml-1">Building / Apartment / Floor</label>
+                        <label className="text-xs font-bold ml-1">
+                          Building / Apartment / Gate / Floor
+                        </label>
                         <Input
                           value={deliveryApartment}
                           onChange={(e) => setDeliveryApartment(e.target.value)}
@@ -286,7 +423,9 @@ export default function CheckoutPage() {
                     </div>
 
                     <div className="space-y-1.5">
-                      <label className="text-xs font-bold ml-1">Rider Instructions (Optional)</label>
+                      <label className="text-xs font-bold ml-1">
+                        Rider Instructions (Optional)
+                      </label>
                       <Textarea
                         rows={2}
                         value={deliveryNotes}
@@ -307,11 +446,13 @@ export default function CheckoutPage() {
               <CardHeader className="px-7 pt-7 pb-4 border-b border-border/50">
                 <CardTitle className="text-lg font-bold">Order Summary</CardTitle>
               </CardHeader>
-
               <CardContent className="p-7 space-y-6">
                 <div className="space-y-3 max-h-72 overflow-y-auto pr-1">
                   {items.map((item) => (
-                    <div key={item.key} className="flex items-center justify-between gap-3">
+                    <div
+                      key={item.key}
+                      className="flex items-center justify-between gap-3"
+                    >
                       <div className="flex items-center gap-3 min-w-0">
                         <div className="relative w-12 h-14 rounded-xl overflow-hidden bg-secondary shrink-0">
                           {item.imageUrl && (
@@ -327,7 +468,7 @@ export default function CheckoutPage() {
                         <div className="min-w-0">
                           <p className="font-bold text-xs truncate">{item.title}</p>
                           <p className="text-[11px] text-muted-foreground">
-                            Size: {item.selectedSize} • Qty: {item.quantity}
+                            Size: {item.selectedSize} &bull; Qty: {item.quantity}
                           </p>
                         </div>
                       </div>
@@ -345,21 +486,31 @@ export default function CheckoutPage() {
                       KES {subtotal.toLocaleString()}
                     </span>
                   </div>
-
                   <div className="flex justify-between text-muted-foreground">
                     <span>
-                      Delivery ({deliveryMethod === 'pickup' ? 'Pickup' : `${quote.distanceKm} km`})
+                      Delivery (
+                      {deliveryMethod === 'pickup'
+                        ? 'Shop Pickup'
+                        : hasSelectedLocation
+                        ? `${quote.distanceKm} km`
+                        : 'Select location'}
+                      )
                     </span>
                     <span className="font-semibold text-foreground">
-                      {quote.deliveryFeeKes === 0
-                        ? 'FREE'
-                        : `KES ${quote.deliveryFeeKes.toLocaleString()}`}
+                      {deliveryMethod === 'pickup' || quote.deliveryFeeKes === 0 ? (
+                        <span className="text-primary font-bold inline-flex items-center gap-1">
+                          <Sparkles size={13} /> FREE
+                        </span>
+                      ) : (
+                        `KES ${quote.deliveryFeeKes.toLocaleString()}`
+                      )}
                     </span>
                   </div>
-
                   <div className="flex justify-between text-lg font-extrabold pt-2 border-t border-border/60">
                     <span>Total to Pay</span>
-                    <span className="text-primary">KES {grandTotal.toLocaleString()}</span>
+                    <span className="text-primary">
+                      KES {grandTotal.toLocaleString()}
+                    </span>
                   </div>
                 </div>
 
@@ -385,7 +536,7 @@ export default function CheckoutPage() {
                 <div className="flex items-center justify-center gap-2 text-[11px] text-muted-foreground text-center">
                   <ShieldCheck size={14} className="text-primary shrink-0" />
                   <span>
-                    Secured by Safaricom Daraja API. Check your phone for the M-Pesa PIN pop-up.
+                    Secured by Safaricom Daraja API. Stock is only deducted upon confirmed M-Pesa payment.
                   </span>
                 </div>
               </CardContent>

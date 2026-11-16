@@ -51,6 +51,7 @@ CREATE OR REPLACE FUNCTION "public"."attach_order_stk_request"("target_order_id"
     AS $$
 DECLARE
   v_order public.orders%ROWTYPE;
+  v_has_valid_req boolean;
   v_attempt_status text;
 BEGIN
   SELECT * INTO v_order
@@ -64,12 +65,9 @@ BEGIN
     RETURN false;
   END IF;
 
-  v_attempt_status := CASE
-    WHEN checkout_req_id IS NOT NULL AND length(trim(checkout_req_id)) > 0 THEN 'pending'
-    ELSE 'failed'
-  END;
+  v_has_valid_req := (checkout_req_id IS NOT NULL AND length(trim(checkout_req_id)) > 0);
+  v_attempt_status := CASE WHEN v_has_valid_req THEN 'pending' ELSE 'failed' END;
 
-  -- Record the individual payment attempt
   INSERT INTO public.payment_attempts (
     store_id,
     order_id,
@@ -84,7 +82,7 @@ BEGIN
     target_store_id,
     target_order_id,
     merchant_req_id,
-    checkout_req_id,
+     NULLIF(trim(checkout_req_id), ''),
     COALESCE(updated_phone, v_order.customer_phone),
     v_order.total_amount,
     v_attempt_status,
@@ -97,18 +95,28 @@ BEGIN
     result_description = EXCLUDED.result_description,
     status = EXCLUDED.status;
 
-  -- Sync the active reference onto the parent order without overwriting a valid CheckoutRequestID with NULL
-  UPDATE public.orders
-  SET
-    mpesa_checkout_request_id = COALESCE(checkout_req_id, mpesa_checkout_request_id),
-    mpesa_merchant_request_id = COALESCE(merchant_req_id, mpesa_merchant_request_id),
-    mpesa_result_desc = result_desc,
-    customer_phone = COALESCE(updated_phone, customer_phone),
-    payment_status = 'pending',
-    order_status = CASE WHEN order_status = 'cancelled' THEN 'pending' ELSE order_status END,
-    payment_expires_at = timezone('utc'::text, now()) + interval '120 seconds'
-  WHERE id = target_order_id
-    AND store_id = target_store_id;
+  IF v_has_valid_req THEN
+    UPDATE public.orders
+    SET
+      mpesa_checkout_request_id = trim(checkout_req_id),
+      mpesa_merchant_request_id = COALESCE(NULLIF(trim(merchant_req_id), ''), mpesa_merchant_request_id),
+      mpesa_result_desc = result_desc,
+      customer_phone = COALESCE(updated_phone, customer_phone),
+      payment_status = 'pending',
+      order_status = CASE WHEN order_status = 'cancelled' THEN 'pending' ELSE order_status END,
+      payment_expires_at = timezone('utc'::text, now()) + interval '120 seconds'
+    WHERE id = target_order_id
+      AND store_id = target_store_id;
+  ELSE
+    -- Initiation failed: do NOT keep stale CheckoutRequestID active or fake a pending timer
+    UPDATE public.orders
+    SET
+      mpesa_result_desc = result_desc,
+      customer_phone = COALESCE(updated_phone, customer_phone),
+      payment_status = 'failed'
+    WHERE id = target_order_id
+      AND store_id = target_store_id;
+  END IF;
 
   RETURN true;
 END;
@@ -116,6 +124,22 @@ $$;
 
 
 ALTER FUNCTION "public"."attach_order_stk_request"("target_order_id" "uuid", "target_store_id" "uuid", "checkout_req_id" "text", "merchant_req_id" "text", "result_desc" "text", "updated_phone" "text") OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."calculate_delivery_fee_kes"("distance_km" numeric) RETURNS numeric
+    LANGUAGE "sql" IMMUTABLE
+    AS $$
+  SELECT CASE
+    WHEN distance_km <= 10 THEN 0::numeric
+    WHEN distance_km <= 20 THEN 150::numeric
+    WHEN distance_km <= 35 THEN 200::numeric
+    WHEN distance_km <= 60 THEN 300::numeric
+    ELSE 1000::numeric
+  END;
+$$;
+
+
+ALTER FUNCTION "public"."calculate_delivery_fee_kes"("distance_km" numeric) OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."calculate_haversine_km"("lat1" double precision, "lng1" double precision, "lat2" double precision, "lng2" double precision) RETURNS numeric
@@ -146,17 +170,31 @@ CREATE OR REPLACE FUNCTION "public"."customer_cancel_pending_order"("target_orde
 DECLARE
   affected integer;
 BEGIN
+  -- Cancels an unpaid pending order without deducting any stock
   UPDATE public.orders
   SET
     payment_status = 'failed',
     order_status = 'cancelled',
-    mpesa_result_desc = 'Cancelled by customer during checkout window'
+    mpesa_result_desc = 'Code 1032: Order cancelled by customer',
+    payment_expires_at = timezone('utc'::text, now())
   WHERE id = target_order_id
     AND store_id = target_store_id
     AND payment_status != 'paid'
     AND order_status = 'pending';
 
   GET DIAGNOSTICS affected = ROW_COUNT;
+
+  IF affected > 0 THEN
+    UPDATE public.payment_attempts
+    SET
+      status = 'cancelled',
+      result_code = 1032,
+      result_description = 'Cancelled by customer',
+      completed_at = COALESCE(completed_at, timezone('utc'::text, now()))
+    WHERE order_id = target_order_id
+      AND status IN ('initiating', 'pending');
+  END IF;
+
   RETURN affected > 0;
 END;
 $$;
@@ -174,9 +212,17 @@ DECLARE
   v_item RECORD;
   v_prod RECORD;
   v_new_variants jsonb;
+  v_recalculated_stock integer;
   v_mapped_attempt_status text;
   v_effective_receipt text;
+  v_caller_role text;
 BEGIN
+  v_caller_role := COALESCE(
+    current_setting('request.jwt.claim.role', true),
+    (NULLIF(current_setting('request.jwt.claims', true), '')::jsonb ->> 'role'),
+    current_user
+  );
+
   SELECT * INTO v_order
   FROM public.orders
   WHERE (target_order_id IS NOT NULL AND id = target_order_id)
@@ -187,15 +233,24 @@ BEGIN
     RETURN NULL;
   END IF;
 
+  -- If called via anon key (when SUPABASE_SERVICE_ROLE_KEY is not set), require matching CheckoutRequestID
+  IF v_caller_role = 'anon' THEN
+    IF checkout_req_id IS NULL
+       OR v_order.mpesa_checkout_request_id IS NULL
+       OR trim(checkout_req_id) != trim(v_order.mpesa_checkout_request_id) THEN
+      RAISE EXCEPTION 'Unauthorized: Valid matching CheckoutRequestID required.';
+    END IF;
+  END IF;
+
   v_mapped_attempt_status := CASE
     WHEN result_code = 0 THEN 'succeeded'
-    WHEN result_code = 1032 THEN 'cancelled'
+    WHEN result_code IN (1032, 1031) THEN 'cancelled'
     WHEN result_code IN (1037, 1019) THEN 'timed_out'
     ELSE 'failed'
   END;
 
   v_effective_receipt := COALESCE(
-    receipt_num,
+    NULLIF(upper(trim(receipt_num)), ''),
     v_order.mpesa_receipt_number,
     CASE
       WHEN result_code = 0 AND checkout_req_id IS NOT NULL THEN 'CONF-' || right(checkout_req_id, 8)
@@ -204,7 +259,6 @@ BEGIN
     END
   );
 
-  -- Update the matching payment_attempts row
   UPDATE public.payment_attempts
   SET
     status = v_mapped_attempt_status,
@@ -221,16 +275,17 @@ BEGIN
           LIMIT 1
         ));
 
-  -- Idempotency guard: if order is already paid, update receipt if newly arrived from webhook, but never double-deduct stock
+  -- Idempotency guard: never double-deduct stock if already paid
   IF v_order.payment_status = 'paid' THEN
-    IF receipt_num IS NOT NULL AND (v_order.mpesa_receipt_number IS NULL OR v_order.mpesa_receipt_number LIKE 'CONF-%') THEN
+    IF v_effective_receipt IS NOT NULL AND (v_order.mpesa_receipt_number IS NULL OR v_order.mpesa_receipt_number LIKE 'CONF-%') THEN
       UPDATE public.orders
-      SET mpesa_receipt_number = receipt_num
+      SET mpesa_receipt_number = v_effective_receipt
       WHERE id = v_order.id;
     END IF;
     RETURN v_order.id;
   END IF;
 
+  -- ONLY deduct stock when result_code = 0 (payment succeeded & order confirmed)
   IF result_code = 0 THEN
     UPDATE public.orders
     SET
@@ -238,10 +293,10 @@ BEGIN
       order_status = CASE WHEN order_status IN ('pending', 'cancelled') THEN 'confirmed' ELSE order_status END,
       mpesa_receipt_number = v_effective_receipt,
       mpesa_result_desc = result_desc,
-      paid_at = timezone('utc'::text, now())
+      paid_at = timezone('utc'::text, now()),
+      payment_expires_at = timezone('utc'::text, now())
     WHERE id = v_order.id;
 
-    -- Atomically deduct stock once
     FOR v_item IN
       SELECT product_id, selected_size, quantity
       FROM public.order_items
@@ -258,7 +313,7 @@ BEGIN
             SELECT COALESCE(
               jsonb_agg(
                 CASE
-                  WHEN (elem->>'size') = v_item.selected_size THEN
+                  WHEN upper(trim(elem->>'size')) = upper(trim(v_item.selected_size)) THEN
                     jsonb_set(
                       elem,
                       '{stock}',
@@ -270,23 +325,30 @@ BEGIN
               '[]'::jsonb
             ) INTO v_new_variants
             FROM jsonb_array_elements(v_prod.variants) AS elem;
+
+            SELECT COALESCE(SUM(GREATEST(0, COALESCE((elem->>'stock')::int, 0))), 0)::int
+            INTO v_recalculated_stock
+            FROM jsonb_array_elements(v_new_variants) AS elem;
           ELSE
             v_new_variants := v_prod.variants;
+            v_recalculated_stock := GREATEST(0, COALESCE(v_prod.stock_count, 0) - v_item.quantity);
           END IF;
 
           UPDATE public.products
           SET
-            stock_count = GREATEST(0, COALESCE(v_prod.stock_count, 0) - v_item.quantity),
+            stock_count = v_recalculated_stock,
             variants = v_new_variants
           WHERE id = v_prod.id;
         END IF;
       END IF;
     END LOOP;
   ELSE
+    -- Prompt cancelled (1032) or failed: DO NOT deduct stock, and expire timer immediately
     UPDATE public.orders
     SET
       payment_status = 'failed',
-      mpesa_result_desc = result_desc
+      mpesa_result_desc = result_desc,
+      payment_expires_at = timezone('utc'::text, now())
     WHERE id = v_order.id;
   END IF;
 
@@ -326,6 +388,47 @@ $$;
 
 
 ALTER FUNCTION "public"."requested_store_id"() OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."submit_manual_mpesa_receipt"("target_order_id" "uuid", "target_store_id" "uuid", "submitted_receipt" "text") RETURNS boolean
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+DECLARE
+  v_clean_receipt text;
+  v_duplicate_exists boolean;
+BEGIN
+  v_clean_receipt := upper(regexp_replace(COALESCE(submitted_receipt, ''), '[^A-Za-z0-9]', '', 'g'));
+
+  IF length(v_clean_receipt) < 10 OR length(v_clean_receipt) > 12 THEN
+    RAISE EXCEPTION 'Invalid M-Pesa receipt format.';
+  END IF;
+
+  SELECT EXISTS (
+    SELECT 1 FROM public.orders
+    WHERE mpesa_receipt_number = v_clean_receipt
+      AND id != target_order_id
+  ) INTO v_duplicate_exists;
+
+  IF v_duplicate_exists THEN
+    RAISE EXCEPTION 'This M-Pesa receipt code has already been used on another order.';
+  END IF;
+
+  UPDATE public.orders
+  SET
+    mpesa_receipt_number = v_clean_receipt,
+    mpesa_result_desc = 'Customer submitted M-Pesa code ' || v_clean_receipt || ' (Pending verification)',
+    payment_status = CASE WHEN payment_status = 'paid' THEN 'paid' ELSE 'pending' END
+  WHERE id = target_order_id
+    AND store_id = target_store_id
+    AND payment_status != 'paid';
+
+  RETURN FOUND;
+END;
+$$;
+
+
+ALTER FUNCTION "public"."submit_manual_mpesa_receipt"("target_order_id" "uuid", "target_store_id" "uuid", "submitted_receipt" "text") OWNER TO "postgres";
 
 SET default_tablespace = '';
 
@@ -463,9 +566,9 @@ CREATE TABLE IF NOT EXISTS "public"."stores" (
     "contact_email" "text" DEFAULT 'contact@luminousdrip.com'::"text" NOT NULL,
     "hero_banner_text" "text" DEFAULT 'Welcome to Luminous Drip Line'::"text" NOT NULL,
     "created_at" timestamp with time zone DEFAULT "timezone"('utc'::"text", "now"()) NOT NULL,
-    "origin_address" "text" DEFAULT 'Nairobi CBD, Kenya'::"text" NOT NULL,
-    "origin_lat" double precision DEFAULT '-1.286389'::numeric NOT NULL,
-    "origin_lng" double precision DEFAULT 36.817223 NOT NULL,
+    "origin_address" "text" DEFAULT 'Luminous Drip Shop'::"text" NOT NULL,
+    "origin_lat" double precision DEFAULT '-1.3554'::numeric NOT NULL,
+    "origin_lng" double precision DEFAULT 36.6562 NOT NULL,
     "base_delivery_fee" numeric(10,2) DEFAULT 150.00 NOT NULL,
     "delivery_fee_per_km" numeric(10,2) DEFAULT 35.00 NOT NULL,
     "min_delivery_fee" numeric(10,2) DEFAULT 200.00 NOT NULL,
@@ -909,6 +1012,12 @@ GRANT ALL ON FUNCTION "public"."attach_order_stk_request"("target_order_id" "uui
 
 
 
+GRANT ALL ON FUNCTION "public"."calculate_delivery_fee_kes"("distance_km" numeric) TO "anon";
+GRANT ALL ON FUNCTION "public"."calculate_delivery_fee_kes"("distance_km" numeric) TO "authenticated";
+GRANT ALL ON FUNCTION "public"."calculate_delivery_fee_kes"("distance_km" numeric) TO "service_role";
+
+
+
 GRANT ALL ON FUNCTION "public"."calculate_haversine_km"("lat1" double precision, "lng1" double precision, "lat2" double precision, "lng2" double precision) TO "anon";
 GRANT ALL ON FUNCTION "public"."calculate_haversine_km"("lat1" double precision, "lng1" double precision, "lat2" double precision, "lng2" double precision) TO "authenticated";
 GRANT ALL ON FUNCTION "public"."calculate_haversine_km"("lat1" double precision, "lng1" double precision, "lat2" double precision, "lng2" double precision) TO "service_role";
@@ -921,9 +1030,10 @@ GRANT ALL ON FUNCTION "public"."customer_cancel_pending_order"("target_order_id"
 
 
 
-GRANT ALL ON FUNCTION "public"."finalize_order_mpesa_payment"("target_order_id" "uuid", "checkout_req_id" "text", "result_code" integer, "result_desc" "text", "receipt_num" "text", "raw_payload" "jsonb") TO "anon";
+REVOKE ALL ON FUNCTION "public"."finalize_order_mpesa_payment"("target_order_id" "uuid", "checkout_req_id" "text", "result_code" integer, "result_desc" "text", "receipt_num" "text", "raw_payload" "jsonb") FROM PUBLIC;
 GRANT ALL ON FUNCTION "public"."finalize_order_mpesa_payment"("target_order_id" "uuid", "checkout_req_id" "text", "result_code" integer, "result_desc" "text", "receipt_num" "text", "raw_payload" "jsonb") TO "authenticated";
 GRANT ALL ON FUNCTION "public"."finalize_order_mpesa_payment"("target_order_id" "uuid", "checkout_req_id" "text", "result_code" integer, "result_desc" "text", "receipt_num" "text", "raw_payload" "jsonb") TO "service_role";
+GRANT ALL ON FUNCTION "public"."finalize_order_mpesa_payment"("target_order_id" "uuid", "checkout_req_id" "text", "result_code" integer, "result_desc" "text", "receipt_num" "text", "raw_payload" "jsonb") TO "anon";
 
 
 
@@ -936,6 +1046,12 @@ GRANT ALL ON FUNCTION "public"."is_store_admin"("target_store_id" "uuid") TO "se
 GRANT ALL ON FUNCTION "public"."requested_store_id"() TO "anon";
 GRANT ALL ON FUNCTION "public"."requested_store_id"() TO "authenticated";
 GRANT ALL ON FUNCTION "public"."requested_store_id"() TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."submit_manual_mpesa_receipt"("target_order_id" "uuid", "target_store_id" "uuid", "submitted_receipt" "text") TO "anon";
+GRANT ALL ON FUNCTION "public"."submit_manual_mpesa_receipt"("target_order_id" "uuid", "target_store_id" "uuid", "submitted_receipt" "text") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."submit_manual_mpesa_receipt"("target_order_id" "uuid", "target_store_id" "uuid", "submitted_receipt" "text") TO "service_role";
 
 
 
@@ -972,7 +1088,7 @@ GRANT SELECT,INSERT ON TABLE "public"."orders" TO "anon";
 
 
 
-GRANT ALL ON TABLE "public"."payment_attempts" TO "anon";
+GRANT SELECT,REFERENCES,TRIGGER,MAINTAIN ON TABLE "public"."payment_attempts" TO "anon";
 GRANT ALL ON TABLE "public"."payment_attempts" TO "authenticated";
 GRANT ALL ON TABLE "public"."payment_attempts" TO "service_role";
 

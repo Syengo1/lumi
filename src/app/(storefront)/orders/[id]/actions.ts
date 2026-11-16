@@ -442,21 +442,6 @@ export async function submitCustomerMpesaReceiptCode(
     return { success: false, error: 'Order not found.' }
   }
 
-  // Prevent duplicate receipt usage across orders
-  const { data: existingWithReceipt } = await adminSupabase
-    .from('orders')
-    .select('id')
-    .eq('mpesa_receipt_number', cleanCode)
-    .neq('id', orderId)
-    .maybeSingle()
-
-  if (existingWithReceipt) {
-    return {
-      success: false,
-      error: 'This M-Pesa receipt code has already been used on another order.',
-    }
-  }
-
   // 1. If an active CheckoutRequestID exists, query Daraja to verify if the STK push succeeded
   if (order.mpesa_checkout_request_id) {
     try {
@@ -481,22 +466,19 @@ export async function submitCustomerMpesaReceiptCode(
         }
       }
     } catch {
-      // Fall through to safe manual receipt logging
+      // Fall through to safe manual receipt RPC logging
     }
   }
 
-  // 2. Record the receipt code for verification without deducting stock until confirmed
-  const { error: updateError } = await adminSupabase
-    .from('orders')
-    .update({
-      mpesa_receipt_number: cleanCode,
-      mpesa_result_desc: `Customer submitted M-Pesa receipt ${cleanCode} (Awaiting verification)`,
-    })
-    .eq('id', orderId)
-    .eq('store_id', storeId)
+  // 2. Record the receipt code via SECURITY DEFINER RPC (checks duplicates & works under anon RLS)
+  const { error: rpcError } = await supabase.rpc('submit_manual_mpesa_receipt', {
+    target_order_id: orderId,
+    target_store_id: storeId,
+    submitted_receipt: cleanCode,
+  })
 
-  if (updateError) {
-    return { success: false, error: updateError.message }
+  if (rpcError) {
+    return { success: false, error: rpcError.message }
   }
 
   revalidatePath(`/orders/${orderId}`)

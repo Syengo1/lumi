@@ -2,7 +2,11 @@
 
 import { createClient } from '@/lib/supabase/server'
 import { getStoreId } from '@/lib/supabase/config'
-import { calculateDeliveryQuote } from '@/lib/geo/haversine'
+import {
+  SHOP_LOCATION,
+  calculateDeliveryQuote,
+  type ProductRelation,
+} from '@/lib/geo/haversine'
 import { initiateDarajaStkPush, normalizeKenyanPhone } from '@/lib/daraja/mpesa'
 import {
   canProceedRateLimit,
@@ -16,6 +20,7 @@ export interface CheckoutItemInput {
   productId: string
   selectedSize: string
   quantity: number
+  variantId?: string
 }
 
 export interface SubmitCheckoutInput {
@@ -51,20 +56,18 @@ export async function getPublicStoreDeliveryConfig() {
 
   const { data: store } = await supabase
     .from('stores')
-    .select(
-      'name, origin_address, origin_lat, origin_lng, base_delivery_fee, delivery_fee_per_km, min_delivery_fee, max_delivery_fee, free_delivery_threshold'
-    )
+    .select('free_delivery_threshold')
     .eq('id', storeId)
     .maybeSingle()
 
   return {
-    origin_address: store?.origin_address || 'Nairobi CBD, Kenya',
-    origin_lat: Number(store?.origin_lat ?? -1.286389),
-    origin_lng: Number(store?.origin_lng ?? 36.817223),
-    base_delivery_fee: Number(store?.base_delivery_fee ?? 150),
-    delivery_fee_per_km: Number(store?.delivery_fee_per_km ?? 35),
-    min_delivery_fee: Number(store?.min_delivery_fee ?? 200),
-    max_delivery_fee: Number(store?.max_delivery_fee ?? 1500),
+    origin_address: SHOP_LOCATION.name,
+    origin_lat: Number(SHOP_LOCATION.lat),
+    origin_lng: Number(SHOP_LOCATION.lng),
+    base_delivery_fee: 150,
+    delivery_fee_per_km: 35,
+    min_delivery_fee: 150,
+    max_delivery_fee: 1000,
     free_delivery_threshold:
       store?.free_delivery_threshold !== null &&
       store?.free_delivery_threshold !== undefined
@@ -86,14 +89,15 @@ export async function processOrderAndInitiateMpesa(input: SubmitCheckoutInput) {
 
   const deliveryMethod: 'delivery' | 'pickup' =
     input.deliveryMethod === 'pickup' ? 'pickup' : 'delivery'
-
   const deliveryAddress =
     deliveryMethod === 'pickup'
-      ? input.deliveryAddress?.trim() || 'Store Pickup'
+      ? input.deliveryAddress?.trim() || 'Shop Pickup'
       : input.deliveryAddress?.trim() || ''
 
   if (deliveryMethod === 'delivery' && deliveryAddress.length < 3) {
-    return { error: 'Please provide a valid delivery street, estate, or landmark.' }
+    return {
+      error: 'Please search or enter a valid delivery street, estate, or landmark.',
+    }
   }
 
   let normalizedPhone: string
@@ -120,19 +124,22 @@ export async function processOrderAndInitiateMpesa(input: SubmitCheckoutInput) {
     if (existing) {
       existing.quantity += qty
     } else {
-      consolidatedItemsMap.set(key, { productId, selectedSize, quantity: qty })
+      consolidatedItemsMap.set(key, {
+        productId,
+        selectedSize,
+        quantity: qty,
+        variantId: key,
+      })
     }
   }
-
   const consolidatedItems = Array.from(consolidatedItemsMap.values())
 
-  // 3. Phase 1 Rate-Limit Check: Verify phone is not on STK cooldown without locking if validation fails
+  // 3. Phase 1 Rate-Limit Check: Verify phone is not on STK cooldown
   const rateCheck = canProceedRateLimit(`stk_phone_${normalizedPhone}`, {
     maxRequests: 4,
     windowMs: 5 * 60 * 1000,
-    minIntervalMs: 35 * 1000,
+    minIntervalMs: 20 * 1000,
   })
-
   if (!rateCheck.allowed) {
     return {
       error: `An M-Pesa prompt was recently sent to +${normalizedPhone}. Please wait ${rateCheck.retryAfterSeconds}s before starting a new STK push.`,
@@ -141,19 +148,9 @@ export async function processOrderAndInitiateMpesa(input: SubmitCheckoutInput) {
 
   const supabase = await createClient()
   const storeId = getStoreId()
+  const storeConfig = await getPublicStoreDeliveryConfig()
 
-  // 4. Fetch authoritative store delivery settings & origin coordinates
-  const { data: store, error: storeError } = await supabase
-    .from('stores')
-    .select('*')
-    .eq('id', storeId)
-    .single()
-
-  if (storeError || !store) {
-    return { error: 'Store configuration not found.' }
-  }
-
-  // 5. Fetch authoritative product prices & stock from Supabase
+  // 4. Fetch authoritative product prices, cost_price (buy_price), & stock from Supabase
   const productIds = Array.from(new Set(consolidatedItems.map((i) => i.productId)))
   const { data: dbProducts, error: prodError } = await supabase
     .from('products')
@@ -166,7 +163,7 @@ export async function processOrderAndInitiateMpesa(input: SubmitCheckoutInput) {
     return { error: 'Unable to verify catalog items.' }
   }
 
-  // 6. Validate cumulative product stock, per-size variant stock, and compute authoritative subtotal
+  // 5. Validate cumulative product stock, per-size variant stock, and compute authoritative subtotal
   const cumulativeProductQty = new Map<string, number>()
   for (const item of consolidatedItems) {
     cumulativeProductQty.set(
@@ -196,7 +193,8 @@ export async function processOrderAndInitiateMpesa(input: SubmitCheckoutInput) {
       return { error: 'One or more items in your bag are no longer available.' }
     }
 
-    const totalProductQtyRequested = cumulativeProductQty.get(product.id) || cartItem.quantity
+    const totalProductQtyRequested =
+      cumulativeProductQty.get(product.id) || cartItem.quantity
     if ((product.stock_count ?? 0) < totalProductQtyRequested) {
       return {
         error: `Insufficient total stock for "${product.title}" (requested ${totalProductQtyRequested}, available ${product.stock_count ?? 0}).`,
@@ -204,7 +202,10 @@ export async function processOrderAndInitiateMpesa(input: SubmitCheckoutInput) {
     }
 
     const qty = cartItem.quantity
-    const variants: ProductVariant[] = Array.isArray(product.variants) ? product.variants : []
+    const variants: ProductVariant[] = Array.isArray(product.variants)
+      ? product.variants
+      : []
+
     if (variants.length > 0) {
       const matchedVariant = variants.find((v) => v.size === cartItem.selectedSize)
       if (!matchedVariant) {
@@ -219,73 +220,59 @@ export async function processOrderAndInitiateMpesa(input: SubmitCheckoutInput) {
       }
     }
 
-    const regular = Math.max(0, Number(product.price) || 0)
-    const offer =
-      product.offer_price &&
-      Number(product.offer_price) > 0 &&
-      Number(product.offer_price) < regular
-        ? Number(product.offer_price)
-        : null
-    const unitPrice = offer ?? regular
-    const lineTotal = unitPrice * qty
+    const relation: ProductRelation = {
+      title: product.title,
+      base_price: Math.max(0, Number(product.price) || 0),
+      sale_price:
+        product.offer_price &&
+        Number(product.offer_price) > 0 &&
+        Number(product.offer_price) < Number(product.price)
+          ? Number(product.offer_price)
+          : null,
+      cost_price: Math.max(0, Number(product.buy_price) || 0),
+    }
 
+    const unitPrice = relation.sale_price ?? relation.base_price
+    const lineTotal = unitPrice * qty
     serverSubtotal += lineTotal
 
     verifiedOrderItems.push({
       store_id: storeId,
       product_id: product.id,
-      title: product.title,
+      title: relation.title,
       sku: product.sku || null,
       selected_size: cartItem.selectedSize,
       primary_color: product.primary_color || 'Black',
       quantity: qty,
-      unit_buy_price: Math.max(0, Number(product.buy_price) || 0),
+      unit_buy_price: relation.cost_price ?? 0,
       unit_price: unitPrice,
       line_total: lineTotal,
       image_url: product.image_urls?.[0] || null,
     })
   }
 
-  // 7. Server-Side Haversine Distance & Delivery Fee Calculation
-  const originLat = Number(store.origin_lat ?? -1.286389)
-  const originLng = Number(store.origin_lng ?? 36.817223)
-
+  // 6. Server-Side Haversine Distance & Tiered Delivery Fee from Shop (-1.3554, 36.6562)
   const customerLat =
     deliveryMethod === 'pickup'
-      ? originLat
+      ? Number(SHOP_LOCATION.lat)
       : Number(input.deliveryLat)
   const customerLng =
     deliveryMethod === 'pickup'
-      ? originLng
+      ? Number(SHOP_LOCATION.lng)
       : Number(input.deliveryLng)
 
   if (!isValidCoordinate(customerLat, customerLng)) {
-    return { error: 'Invalid delivery GPS coordinates. Please pin your location on the map.' }
+    return {
+      error: 'Invalid delivery GPS coordinates. Please search or pin your location on the map.',
+    }
   }
 
-  let deliveryQuote: {
-    distanceKm: number
-    deliveryFeeKes: number
-    isFreeDelivery: boolean
-  }
-
+  let deliveryQuote: ReturnType<typeof calculateDeliveryQuote>
   try {
     deliveryQuote = calculateDeliveryQuote(
       { lat: customerLat, lng: customerLng },
       serverSubtotal,
-      {
-        origin_lat: originLat,
-        origin_lng: originLng,
-        base_delivery_fee: Number(store.base_delivery_fee ?? 150),
-        delivery_fee_per_km: Number(store.delivery_fee_per_km ?? 35),
-        min_delivery_fee: Number(store.min_delivery_fee ?? 200),
-        max_delivery_fee: Number(store.max_delivery_fee ?? 1500),
-        free_delivery_threshold:
-          store.free_delivery_threshold !== null &&
-          store.free_delivery_threshold !== undefined
-            ? Number(store.free_delivery_threshold)
-            : null,
-      },
+      storeConfig,
       deliveryMethod
     )
   } catch (geoErr) {
@@ -293,19 +280,21 @@ export async function processOrderAndInitiateMpesa(input: SubmitCheckoutInput) {
       error:
         geoErr instanceof Error
           ? geoErr.message
-          : 'Failed to calculate delivery distance.',
+          : 'Failed to calculate delivery distance from shop.',
     }
   }
 
-  const serverTotalAmount = Math.max(1, Math.round(serverSubtotal + deliveryQuote.deliveryFeeKes))
+  const serverTotalAmount = Math.max(
+    1,
+    Math.round(serverSubtotal + deliveryQuote.deliveryFeeKes)
+  )
   const orderNumber = `LDL${Date.now().toString().slice(-6)}${Math.random()
     .toString(36)
     .substring(2, 4)
     .toUpperCase()}`
-
   const expiresAtIso = new Date(Date.now() + 120 * 1000).toISOString()
 
-  // 8. Insert Order into Supabase
+  // 7. Insert Order into Supabase
   const { data: createdOrder, error: orderError } = await supabase
     .from('orders')
     .insert({
@@ -338,7 +327,7 @@ export async function processOrderAndInitiateMpesa(input: SubmitCheckoutInput) {
     }
   }
 
-  // 9. Insert Order Items (and cancel the order cleanly if item insertion fails)
+  // 8. Insert Order Items
   const itemsWithOrderId = verifiedOrderItems.map((item) => ({
     ...item,
     order_id: createdOrder.id,
@@ -356,7 +345,7 @@ export async function processOrderAndInitiateMpesa(input: SubmitCheckoutInput) {
     return { error: `Failed to save order items: ${itemsError.message}` }
   }
 
-  // 10. Trigger Safaricom M-Pesa Daraja STK Push & verify RPC persistence
+  // 9. Trigger Safaricom M-Pesa Daraja STK Push & persist CheckoutRequestID
   try {
     const stkResponse = await initiateDarajaStkPush({
       phone: normalizedPhone,
@@ -365,7 +354,6 @@ export async function processOrderAndInitiateMpesa(input: SubmitCheckoutInput) {
       description: 'LuminousDrip',
     })
 
-    // Phase 2 Rate-Limit Commit: Lock phone cooldown only after Daraja accepts the push
     commitRateLimit(`stk_phone_${normalizedPhone}`, 5 * 60 * 1000)
     markStkPushInitiated(createdOrder.id)
 
@@ -411,7 +399,7 @@ export async function processOrderAndInitiateMpesa(input: SubmitCheckoutInput) {
         ? stkErr.message
         : 'Order saved, but STK push could not be sent automatically.'
 
-    const { error: failRpcError } = await supabase.rpc('attach_order_stk_request', {
+    await supabase.rpc('attach_order_stk_request', {
       target_order_id: createdOrder.id,
       target_store_id: storeId,
       checkout_req_id: null,
@@ -419,13 +407,6 @@ export async function processOrderAndInitiateMpesa(input: SubmitCheckoutInput) {
       result_desc: `STK Error: ${errMsg}`,
       updated_phone: normalizedPhone,
     })
-
-    if (failRpcError) {
-      console.error(
-        `[Checkout Failure Log RPC Error] Order #${createdOrder.order_number}:`,
-        failRpcError.message
-      )
-    }
 
     revalidatePath('/orders')
     revalidatePath(`/orders/${createdOrder.id}`)
