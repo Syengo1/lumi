@@ -1,6 +1,6 @@
 'use client'
 
-import { useState, useEffect, useTransition, useRef } from 'react'
+import { useState, useEffect, useTransition, useRef, useCallback } from 'react'
 import { useRouter } from 'next/navigation'
 import { useCart } from './cart-context'
 import { createClient } from '@/lib/supabase/client'
@@ -11,7 +11,7 @@ import {
   cancelCustomerPendingOrder,
   submitCustomerMpesaReceiptCode,
 } from '@/app/(storefront)/orders/[id]/actions'
-import { RotateCcw, ShoppingBag, ShieldCheck } from 'lucide-react'
+import { RotateCcw, ShoppingBag, XCircle } from 'lucide-react'
 import { PaymentStatusHeader } from './payment-tracker/payment-status-header'
 import { StkPromptControls } from './payment-tracker/stk-prompt-controls'
 import { ManualPaybillFallback } from './payment-tracker/manual-paybill-fallback'
@@ -21,6 +21,19 @@ import {
   type OrderPaymentTrackerProps,
   type TrackerFeedback,
 } from './payment-tracker/types'
+
+function isHandsetCancellationDesc(desc: string | null | undefined): boolean {
+  if (!desc) return false
+  const lower = desc.toLowerCase()
+  return (
+    lower.includes('1032') ||
+    lower.includes('1031') ||
+    lower.includes('cancelled by customer') ||
+    lower.includes('cancelled by user') ||
+    lower.includes('cancelled on the phone') ||
+    lower.includes('request cancelled')
+  )
+}
 
 export function OrderPaymentTracker({
   orderId,
@@ -50,56 +63,130 @@ export function OrderPaymentTracker({
     !initialCheckoutRequestId || Boolean(initialResultDesc?.startsWith('STK Error:'))
 
   const [expiresAtIso, setExpiresAtIso] = useState(initialExpiresAt)
-  const [secondsLeft, setSecondsLeft] = useState<number>(WINDOW_SECONDS)
+  const [secondsLeft, setSecondsLeft] = useState<number>(() =>
+    initialPaymentStatus === 'pending' &&
+    initialOrderStatus !== 'cancelled' &&
+    !hasInitialDispatchError
+      ? WINDOW_SECONDS
+      : 0
+  )
   const [resendCooldown, setResendCooldown] = useState<number>(() =>
-    hasInitialDispatchError ? 0 : 20
+    hasInitialDispatchError || initialPaymentStatus === 'failed' ? 0 : 15
   )
-
-  const [feedback, setFeedback] = useState<TrackerFeedback | null>(() =>
-    hasInitialDispatchError && initialResultDesc
-      ? { type: 'error', text: initialResultDesc }
-      : null
-  )
+  const [feedback, setFeedback] = useState<TrackerFeedback | null>(() => {
+    if (hasInitialDispatchError && initialResultDesc) {
+      return { type: 'error', text: initialResultDesc }
+    }
+    if (initialPaymentStatus === 'failed' && initialResultDesc) {
+      return { type: 'error', text: initialResultDesc }
+    }
+    return null
+  })
   const [isPending, startTransition] = useTransition()
   const isPollingRef = useRef(false)
+  const zeroCheckTriggeredRef = useRef(false)
 
   const isPaid = paymentStatus === 'paid'
   const isFailed = paymentStatus === 'failed'
   const isCancelled = orderStatus === 'cancelled'
+  const isPromptCancelled = isFailed && isHandsetCancellationDesc(resultDesc)
   const isDispatchFailed =
     !isPaid &&
     !isCancelled &&
     (!checkoutReqId || Boolean(resultDesc?.startsWith('STK Error:')))
-  const isExpired = !isPaid && !isCancelled && secondsLeft <= 0
 
-  // 1. Live 1-second Countdown Timer
+  // Derive active countdown seconds during render so terminal states zero out instantaneously
+  // without calling setState synchronously inside useEffect
+  const activeSecondsLeft =
+    isPaid || isCancelled || isFailed || isDispatchFailed ? 0 : secondsLeft
+  const isExpired = !isPaid && !isCancelled && !isFailed && activeSecondsLeft <= 0
+
+  const applyOrderUpdate = useCallback(
+    (
+      updated: {
+        payment_status?: 'pending' | 'paid' | 'failed'
+        order_status?: string
+        mpesa_checkout_request_id?: string | null
+        mpesa_receipt_number?: string | null
+        mpesa_result_desc?: string | null
+        payment_expires_at?: string | null
+        customer_phone?: string
+      },
+      gatewayMsg?: string
+    ) => {
+      if (updated.payment_status) {
+        setPaymentStatus(updated.payment_status)
+        if (updated.payment_status === 'failed' || updated.payment_status === 'paid') {
+          setSecondsLeft(0)
+          if (updated.payment_status === 'failed') {
+            setResendCooldown(0)
+          }
+        }
+      }
+      if (updated.order_status) {
+        setOrderStatus(updated.order_status)
+        if (updated.order_status === 'cancelled') {
+          setSecondsLeft(0)
+          setResendCooldown(0)
+        }
+      }
+      if (updated.mpesa_checkout_request_id !== undefined) {
+        setCheckoutReqId(updated.mpesa_checkout_request_id)
+      }
+      if (updated.mpesa_receipt_number !== undefined) {
+        setReceipt(updated.mpesa_receipt_number)
+      }
+      if (updated.mpesa_result_desc !== undefined) {
+        setResultDesc(updated.mpesa_result_desc)
+      }
+      if (updated.payment_expires_at) {
+        setExpiresAtIso(updated.payment_expires_at)
+      }
+      if (updated.customer_phone) {
+        setPhone(updated.customer_phone)
+      }
+
+      if (updated.payment_status === 'paid') {
+        setFeedback({
+          type: 'info',
+          text: gatewayMsg || 'M-Pesa payment confirmed! Your order is now confirmed.',
+        })
+      } else if (updated.payment_status === 'failed') {
+        const desc = gatewayMsg || updated.mpesa_result_desc
+        if (desc) {
+          setFeedback({ type: 'error', text: desc })
+        }
+      }
+    },
+    []
+  )
+
+  // 1. Live 1-second Countdown Timer (Only updates state inside the interval callback)
   useEffect(() => {
-    if (isPaid || isCancelled) return
+    if (isPaid || isCancelled || isFailed || isDispatchFailed) return
 
     const parsedTarget = Date.parse(expiresAtIso)
     const targetMs = Number.isFinite(parsedTarget)
       ? parsedTarget
       : Date.now() + WINDOW_SECONDS * 1000
 
-    const tick = () => {
+    const interval = setInterval(() => {
       const remaining = Math.max(
         0,
         Math.min(WINDOW_SECONDS, Math.ceil((targetMs - Date.now()) / 1000))
       )
       setSecondsLeft(remaining)
       setResendCooldown((prev) => Math.max(0, prev - 1))
-    }
+    }, 1000)
 
-    tick()
-    const interval = setInterval(tick, 1000)
     return () => clearInterval(interval)
-  }, [expiresAtIso, isPaid, isCancelled])
+  }, [expiresAtIso, isPaid, isCancelled, isFailed, isDispatchFailed])
 
   // 2. Instant Supabase Realtime Listener
   useEffect(() => {
     if (isPaid || isCancelled) return
-    const supabase = createClient()
 
+    const supabase = createClient()
     const channel = supabase
       .channel(`order-payment-${orderId}`)
       .on(
@@ -117,14 +204,10 @@ export function OrderPaymentTracker({
             mpesa_checkout_request_id?: string | null
             mpesa_receipt_number?: string | null
             mpesa_result_desc?: string | null
+            payment_expires_at?: string | null
+            customer_phone?: string
           }
-          if (updated.payment_status) setPaymentStatus(updated.payment_status)
-          if (updated.order_status) setOrderStatus(updated.order_status)
-          if (updated.mpesa_checkout_request_id !== undefined) {
-            setCheckoutReqId(updated.mpesa_checkout_request_id)
-          }
-          if (updated.mpesa_receipt_number) setReceipt(updated.mpesa_receipt_number)
-          if (updated.mpesa_result_desc) setResultDesc(updated.mpesa_result_desc)
+          applyOrderUpdate(updated)
         }
       )
       .subscribe()
@@ -132,29 +215,22 @@ export function OrderPaymentTracker({
     return () => {
       supabase.removeChannel(channel)
     }
-  }, [orderId, isPaid, isCancelled])
+  }, [orderId, isPaid, isCancelled, applyOrderUpdate])
 
-  // 3. Background Poll every 10s (Checks Supabase DB & runs single fallback Daraja query at +90s)
+  // 3. Fast Background Poll every 4s (Detects webhook updates & handset cancellations rapidly)
   useEffect(() => {
     if (isPaid || isFailed || isCancelled || isDispatchFailed) return
 
     let cancelled = false
     let timerId: ReturnType<typeof setTimeout>
 
-    const pollOnce = async () => {
+    const pollOnce = async (forceQuery = false) => {
       if (cancelled || isPollingRef.current) return
       isPollingRef.current = true
       try {
-        const res = await checkCustomerOrderPaymentStatus(orderId, false)
+        const res = await checkCustomerOrderPaymentStatus(orderId, forceQuery)
         if (!cancelled && res.order) {
-          setPaymentStatus(res.order.payment_status as 'pending' | 'paid' | 'failed')
-          setOrderStatus(res.order.order_status)
-          if (res.order.mpesa_checkout_request_id) {
-            setCheckoutReqId(res.order.mpesa_checkout_request_id)
-          }
-          if (res.order.mpesa_receipt_number) setReceipt(res.order.mpesa_receipt_number)
-          if (res.order.mpesa_result_desc) setResultDesc(res.order.mpesa_result_desc)
-
+          applyOrderUpdate(res.order, res.gatewayMessage)
           if (
             res.order.payment_status === 'paid' ||
             res.order.payment_status === 'failed' ||
@@ -168,38 +244,55 @@ export function OrderPaymentTracker({
       }
 
       if (!cancelled) {
-        timerId = setTimeout(pollOnce, 10000)
+        timerId = setTimeout(() => void pollOnce(false), 4000)
       }
     }
 
-    timerId = setTimeout(pollOnce, 10000)
-
+    timerId = setTimeout(() => void pollOnce(false), 4000)
     return () => {
       cancelled = true
       clearTimeout(timerId)
     }
-  }, [orderId, isPaid, isFailed, isCancelled, isDispatchFailed])
+  }, [orderId, isPaid, isFailed, isCancelled, isDispatchFailed, applyOrderUpdate])
+
+  // 4. Final Daraja Reconciliation Query if Countdown Reaches 0
+  useEffect(() => {
+    if (
+      activeSecondsLeft === 0 &&
+      paymentStatus === 'pending' &&
+      orderStatus !== 'cancelled' &&
+      !isDispatchFailed &&
+      !zeroCheckTriggeredRef.current
+    ) {
+      zeroCheckTriggeredRef.current = true
+      const timerId = setTimeout(async () => {
+        const res = await checkCustomerOrderPaymentStatus(orderId, true)
+        if (res.order) {
+          applyOrderUpdate(res.order, res.gatewayMessage)
+        }
+      }, 0)
+      return () => clearTimeout(timerId)
+    }
+  }, [
+    activeSecondsLeft,
+    paymentStatus,
+    orderStatus,
+    isDispatchFailed,
+    orderId,
+    applyOrderUpdate,
+  ])
 
   const handleManualCheck = () => {
     setFeedback(null)
     startTransition(async () => {
       const res = await checkCustomerOrderPaymentStatus(orderId, true)
+      if (res.error) {
+        setFeedback({ type: 'error', text: res.error })
+        return
+      }
       if (res.order) {
-        setPaymentStatus(res.order.payment_status as 'pending' | 'paid' | 'failed')
-        setOrderStatus(res.order.order_status)
-        setReceipt(res.order.mpesa_receipt_number)
-        setResultDesc(res.order.mpesa_result_desc)
-        if (res.order.payment_status === 'paid') {
-          setFeedback({ type: 'info', text: 'M-Pesa payment confirmed!' })
-        } else if (res.order.payment_status === 'failed') {
-          setFeedback({
-            type: 'error',
-            text:
-              res.gatewayMessage ||
-              res.order.mpesa_result_desc ||
-              'M-Pesa prompt was declined or timed out.',
-          })
-        } else {
+        applyOrderUpdate(res.order, res.gatewayMessage)
+        if (res.order.payment_status === 'pending') {
           setFeedback({
             type: 'info',
             text:
@@ -215,12 +308,6 @@ export function OrderPaymentTracker({
     setFeedback(null)
     startTransition(async () => {
       const res = await resendCustomerStkPush(orderId, phone)
-      if (res.payment_expires_at) {
-        setExpiresAtIso(res.payment_expires_at)
-        setSecondsLeft(WINDOW_SECONDS)
-        setPaymentStatus('pending')
-        setOrderStatus('pending')
-      }
       if (res.customer_phone) {
         setPhone(res.customer_phone)
         setEditingPhone(false)
@@ -228,10 +315,21 @@ export function OrderPaymentTracker({
       if (res.error) {
         setResendCooldown(0)
         setFeedback({ type: 'error', text: res.error })
-      } else if (res.message) {
-        if (res.checkoutRequestId) setCheckoutReqId(res.checkoutRequestId)
-        setResendCooldown(RESEND_COOLDOWN_SECONDS)
-        setResultDesc('Success. Request accepted for processing')
+        return
+      }
+      if (res.payment_expires_at) {
+        zeroCheckTriggeredRef.current = false
+        setExpiresAtIso(res.payment_expires_at)
+        setSecondsLeft(WINDOW_SECONDS)
+        setPaymentStatus('pending')
+        setOrderStatus('pending')
+      }
+      if (res.checkoutRequestId) {
+        setCheckoutReqId(res.checkoutRequestId)
+      }
+      setResendCooldown(RESEND_COOLDOWN_SECONDS)
+      setResultDesc('Success. Request accepted for processing')
+      if (res.message) {
         setFeedback({ type: 'info', text: res.message })
       }
     })
@@ -244,11 +342,41 @@ export function OrderPaymentTracker({
       if (res.error) {
         setFeedback({ type: 'error', text: res.error })
       } else if (res.success) {
-        setPaymentStatus('paid')
-        setOrderStatus('confirmed')
         setReceipt(res.receipt || code.toUpperCase())
-        setResultDesc('Verified via M-Pesa Receipt Code')
+        if (res.verifiedImmediately) {
+          setPaymentStatus('paid')
+          setOrderStatus('confirmed')
+          setSecondsLeft(0)
+          setResultDesc('Verified via M-Pesa Receipt Code')
+          setFeedback({
+            type: 'info',
+            text: res.message || 'M-Pesa payment confirmed!',
+          })
+        } else {
+          setResultDesc(`Receipt ${res.receipt || code.toUpperCase()} submitted for verification`)
+          setFeedback({
+            type: 'info',
+            text:
+              res.message ||
+              'Receipt submitted! Your order will be confirmed once verified.',
+          })
+        }
       }
+    })
+  }
+
+  const handleCancelOrderOnly = () => {
+    setFeedback(null)
+    startTransition(async () => {
+      const res = await cancelCustomerPendingOrder(orderId)
+      if (res.error) {
+        setFeedback({ type: 'error', text: res.error })
+        return
+      }
+      setSecondsLeft(0)
+      setOrderStatus('cancelled')
+      setPaymentStatus('failed')
+      setResultDesc('Order cancelled by customer. No stock was deducted.')
     })
   }
 
@@ -260,7 +388,6 @@ export function OrderPaymentTracker({
         setFeedback({ type: 'error', text: res.error })
         return
       }
-
       items.forEach((item) => {
         addItem(
           {
@@ -278,7 +405,7 @@ export function OrderPaymentTracker({
           false
         )
       })
-
+      setSecondsLeft(0)
       setOrderStatus('cancelled')
       setPaymentStatus('failed')
       router.push('/checkout')
@@ -291,9 +418,11 @@ export function OrderPaymentTracker({
         orderNumber={orderNumber}
         phone={phone}
         receipt={receipt}
+        resultDesc={resultDesc}
         totalAmount={totalAmount}
         isPaid={isPaid}
         isCancelled={isCancelled}
+        isPromptCancelled={isPromptCancelled}
         isDispatchFailed={isDispatchFailed}
         isExpired={isExpired}
         isFailed={isFailed}
@@ -302,8 +431,9 @@ export function OrderPaymentTracker({
       {!isPaid && !isCancelled && (
         <div className="max-w-md mx-auto p-5 rounded-2xl bg-card shadow-xs space-y-4">
           <StkPromptControls
-            secondsLeft={secondsLeft}
+            secondsLeft={activeSecondsLeft}
             isFailed={isFailed}
+            isPromptCancelled={isPromptCancelled}
             isDispatchFailed={isDispatchFailed}
             feedback={feedback}
             phone={phone}
@@ -314,6 +444,7 @@ export function OrderPaymentTracker({
             onToggleEditPhone={setEditingPhone}
             onManualCheck={handleManualCheck}
             onResendStk={handleResendStk}
+            onCancelOrder={handleCancelOrderOnly}
           />
 
           <ManualPaybillFallback
@@ -333,16 +464,21 @@ export function OrderPaymentTracker({
               <RotateCcw size={13} />
               Cancel Order &amp; Edit Bag
             </button>
-
-            <span className="text-[11px] text-muted-foreground flex items-center gap-1">
-              <ShieldCheck size={12} className="text-primary" /> Live Realtime Sync
-            </span>
+            <button
+              type="button"
+              disabled={isPending}
+              onClick={handleCancelOrderOnly}
+              className="inline-flex items-center gap-1 text-xs font-semibold text-destructive hover:underline cursor-pointer"
+            >
+              <XCircle size={13} />
+              Cancel Order
+            </button>
           </div>
         </div>
       )}
 
       {isCancelled && (
-        <div className="flex justify-center pt-2">
+        <div className="flex flex-wrap justify-center gap-3 pt-2">
           <Button
             type="button"
             onClick={() => router.push('/shop')}
@@ -355,7 +491,7 @@ export function OrderPaymentTracker({
 
       {resultDesc && !isPaid && (
         <p className="text-center text-xs text-muted-foreground max-w-lg mx-auto">
-          Daraja Status: <span className="font-semibold text-foreground">{resultDesc}</span>
+          M-Pesa Status: <span className="font-semibold text-foreground">{resultDesc}</span>
         </p>
       )}
     </div>

@@ -16,6 +16,7 @@ const globalForRateLimit = globalThis as unknown as {
 
 function getRateLimitState(): GlobalRateLimitState {
   const existing = globalForRateLimit.__luminousRateLimit || {}
+
   const state: GlobalRateLimitState = {
     buckets:
       existing.buckets instanceof Map
@@ -30,6 +31,7 @@ function getRateLimitState(): GlobalRateLimitState {
         ? existing.lastAutoQueryTimestamps
         : new Map<string, number>(),
   }
+
   globalForRateLimit.__luminousRateLimit = state
   return state
 }
@@ -93,6 +95,11 @@ export function commitRateLimit(key: string, windowMs: number): void {
   buckets.set(key, existing)
 }
 
+export function clearRateLimit(key: string): void {
+  const { buckets } = getRateLimitState()
+  buckets.delete(key)
+}
+
 export function checkRateLimit(
   key: string,
   options: {
@@ -120,14 +127,15 @@ export function recordOrderQueryAttempt(orderId: string) {
 }
 
 /**
- * Runs a single background Daraja reconciliation check at +90s if the webhook callback
- * hasn't arrived yet. During the first 90s, background polls only check Supabase.
+ * Runs background Daraja reconciliation checks starting 12s after STK push initiation
+ * and every 15s thereafter so handset cancellations (1032) or completions (0) are
+ * detected rapidly without exceeding Safaricom's 5 req/60s SpikeArrest quota.
  */
 export function shouldRunScheduledDarajaQuery(
   orderId: string,
   lastInitiatedIso: string,
-  graceMs = 90000,
-  intervalMs = 60000
+  graceMs = 12_000,
+  intervalMs = 15_000
 ): boolean {
   const { stkInitiatedTimestamps, lastAutoQueryTimestamps } = getRateLimitState()
   const now = Date.now()

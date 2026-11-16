@@ -165,7 +165,7 @@ $$;
 ALTER FUNCTION "public"."customer_cancel_pending_order"("target_order_id" "uuid", "target_store_id" "uuid") OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."finalize_order_mpesa_payment"("target_order_id" "uuid", "checkout_req_id" "text", "result_code" integer, "result_desc" "text", "receipt_num" "text" DEFAULT NULL::"text") RETURNS "uuid"
+CREATE OR REPLACE FUNCTION "public"."finalize_order_mpesa_payment"("target_order_id" "uuid", "checkout_req_id" "text", "result_code" integer, "result_desc" "text", "receipt_num" "text" DEFAULT NULL::"text", "raw_payload" "jsonb" DEFAULT NULL::"jsonb") RETURNS "uuid"
     LANGUAGE "plpgsql" SECURITY DEFINER
     SET "search_path" TO 'public'
     AS $$
@@ -175,6 +175,7 @@ DECLARE
   v_prod RECORD;
   v_new_variants jsonb;
   v_mapped_attempt_status text;
+  v_effective_receipt text;
 BEGIN
   SELECT * INTO v_order
   FROM public.orders
@@ -186,7 +187,6 @@ BEGIN
     RETURN NULL;
   END IF;
 
-  -- Map Daraja ResultCode to explicit payment_attempts status
   v_mapped_attempt_status := CASE
     WHEN result_code = 0 THEN 'succeeded'
     WHEN result_code = 1032 THEN 'cancelled'
@@ -194,21 +194,40 @@ BEGIN
     ELSE 'failed'
   END;
 
-  -- Update the matching payment_attempts row
-  IF checkout_req_id IS NOT NULL THEN
-    UPDATE public.payment_attempts
-    SET
-      status = v_mapped_attempt_status,
-      result_code = result_code,
-      result_description = result_desc,
-      mpesa_receipt_number = COALESCE(receipt_num, mpesa_receipt_number),
-      completed_at = COALESCE(completed_at, timezone('utc'::text, now()))
-    WHERE checkout_request_id = checkout_req_id
-      AND order_id = v_order.id;
-  END IF;
+  v_effective_receipt := COALESCE(
+    receipt_num,
+    v_order.mpesa_receipt_number,
+    CASE
+      WHEN result_code = 0 AND checkout_req_id IS NOT NULL THEN 'CONF-' || right(checkout_req_id, 8)
+      WHEN result_code = 0 THEN 'MPESA-PAID'
+      ELSE NULL
+    END
+  );
 
-  -- Idempotency guard: if order is already paid, never deduct stock a second time
+  -- Update the matching payment_attempts row
+  UPDATE public.payment_attempts
+  SET
+    status = v_mapped_attempt_status,
+    result_code = finalize_order_mpesa_payment.result_code,
+    result_description = result_desc,
+    mpesa_receipt_number = COALESCE(v_effective_receipt, mpesa_receipt_number),
+    raw_callback_payload = COALESCE(raw_payload, raw_callback_payload),
+    completed_at = COALESCE(completed_at, timezone('utc'::text, now()))
+  WHERE (checkout_req_id IS NOT NULL AND checkout_request_id = checkout_req_id)
+     OR (checkout_req_id IS NULL AND id = (
+          SELECT id FROM public.payment_attempts
+          WHERE order_id = v_order.id
+          ORDER BY created_at DESC
+          LIMIT 1
+        ));
+
+  -- Idempotency guard: if order is already paid, update receipt if newly arrived from webhook, but never double-deduct stock
   IF v_order.payment_status = 'paid' THEN
+    IF receipt_num IS NOT NULL AND (v_order.mpesa_receipt_number IS NULL OR v_order.mpesa_receipt_number LIKE 'CONF-%') THEN
+      UPDATE public.orders
+      SET mpesa_receipt_number = receipt_num
+      WHERE id = v_order.id;
+    END IF;
     RETURN v_order.id;
   END IF;
 
@@ -217,7 +236,7 @@ BEGIN
     SET
       payment_status = 'paid',
       order_status = CASE WHEN order_status IN ('pending', 'cancelled') THEN 'confirmed' ELSE order_status END,
-      mpesa_receipt_number = COALESCE(receipt_num, mpesa_receipt_number),
+      mpesa_receipt_number = v_effective_receipt,
       mpesa_result_desc = result_desc,
       paid_at = timezone('utc'::text, now())
     WHERE id = v_order.id;
@@ -276,7 +295,7 @@ END;
 $$;
 
 
-ALTER FUNCTION "public"."finalize_order_mpesa_payment"("target_order_id" "uuid", "checkout_req_id" "text", "result_code" integer, "result_desc" "text", "receipt_num" "text") OWNER TO "postgres";
+ALTER FUNCTION "public"."finalize_order_mpesa_payment"("target_order_id" "uuid", "checkout_req_id" "text", "result_code" integer, "result_desc" "text", "receipt_num" "text", "raw_payload" "jsonb") OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."is_store_admin"("target_store_id" "uuid") RETURNS boolean
@@ -902,9 +921,9 @@ GRANT ALL ON FUNCTION "public"."customer_cancel_pending_order"("target_order_id"
 
 
 
-GRANT ALL ON FUNCTION "public"."finalize_order_mpesa_payment"("target_order_id" "uuid", "checkout_req_id" "text", "result_code" integer, "result_desc" "text", "receipt_num" "text") TO "anon";
-GRANT ALL ON FUNCTION "public"."finalize_order_mpesa_payment"("target_order_id" "uuid", "checkout_req_id" "text", "result_code" integer, "result_desc" "text", "receipt_num" "text") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."finalize_order_mpesa_payment"("target_order_id" "uuid", "checkout_req_id" "text", "result_code" integer, "result_desc" "text", "receipt_num" "text") TO "service_role";
+GRANT ALL ON FUNCTION "public"."finalize_order_mpesa_payment"("target_order_id" "uuid", "checkout_req_id" "text", "result_code" integer, "result_desc" "text", "receipt_num" "text", "raw_payload" "jsonb") TO "anon";
+GRANT ALL ON FUNCTION "public"."finalize_order_mpesa_payment"("target_order_id" "uuid", "checkout_req_id" "text", "result_code" integer, "result_desc" "text", "receipt_num" "text", "raw_payload" "jsonb") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."finalize_order_mpesa_payment"("target_order_id" "uuid", "checkout_req_id" "text", "result_code" integer, "result_desc" "text", "receipt_num" "text", "raw_payload" "jsonb") TO "service_role";
 
 
 

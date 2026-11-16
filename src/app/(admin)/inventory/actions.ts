@@ -194,17 +194,46 @@ export async function updateProduct(id: string, formData: FormData) {
   redirect('/inventory')
 }
 
+// Replace adjustProductStock in src/app/(admin)/inventory/actions.ts (lines 169-179) with:
 export async function adjustProductStock(id: string, nextStock: number) {
   const { supabase, storeId } = await requireStoreAdmin()
   const clamped = Math.max(0, Math.floor(nextStock))
 
-  const { error } = await supabase
+  const { data: product } = await supabase
     .from('products')
-    .update({ stock_count: clamped })
+    .select('stock_count, variants')
     .eq('id', id)
     .eq('store_id', storeId)
+    .maybeSingle()
 
-  if (error) throw new Error(`Stock update failed: ${error.message}`)
+  const variants: ProductVariant[] = Array.isArray(product?.variants)
+    ? [...(product.variants as ProductVariant[])]
+    : []
+
+  if (variants.length > 0) {
+    const currentSum = variants.reduce((sum, v) => sum + (Number(v.stock) || 0), 0)
+    const delta = clamped - currentSum
+    if (delta !== 0) {
+      variants[0] = {
+        ...variants[0],
+        stock: Math.max(0, (Number(variants[0].stock) || 0) + delta),
+      }
+    }
+    const syncedSum = variants.reduce((sum, v) => sum + (Number(v.stock) || 0), 0)
+    const { error } = await supabase
+      .from('products')
+      .update({ stock_count: syncedSum, variants })
+      .eq('id', id)
+      .eq('store_id', storeId)
+    if (error) throw new Error(`Stock update failed: ${error.message}`)
+  } else {
+    const { error } = await supabase
+      .from('products')
+      .update({ stock_count: clamped })
+      .eq('id', id)
+      .eq('store_id', storeId)
+    if (error) throw new Error(`Stock update failed: ${error.message}`)
+  }
 
   revalidateStorePaths()
 }

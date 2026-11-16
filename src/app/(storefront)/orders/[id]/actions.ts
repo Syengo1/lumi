@@ -1,6 +1,10 @@
 'use server'
 
-import { createClient } from '@/lib/supabase/server'
+import { revalidatePath } from 'next/cache'
+import {
+  createServerSupabaseClient,
+  createServiceRoleSupabaseClient,
+} from '@/lib/supabase/server'
 import { getStoreId } from '@/lib/supabase/config'
 import {
   initiateDarajaStkPush,
@@ -10,37 +14,39 @@ import {
 import {
   canProceedRateLimit,
   checkRateLimit,
+  clearRateLimit,
   commitRateLimit,
   markStkPushInitiated,
-  recordOrderQueryAttempt,
   shouldRunScheduledDarajaQuery,
 } from '@/lib/rate-limit'
-import { revalidatePath } from 'next/cache'
 
-const UUID_REGEX =
-  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
-
-// Valid Safaricom M-Pesa receipt: 10 alphanumeric chars, starts with a letter, contains at least one digit
-const MPESA_RECEIPT_REGEX = /^(?=.*[0-9])[A-Z][A-Z0-9]{9}$/
-
-function isValidUuid(id: string): boolean {
-  return Boolean(id && UUID_REGEX.test(id.trim()))
+export interface CustomerOrderStatusSnapshot {
+  id: string
+  order_number: string
+  payment_status: 'pending' | 'paid' | 'failed'
+  order_status: string
+  mpesa_checkout_request_id: string | null
+  mpesa_receipt_number: string | null
+  mpesa_result_desc: string | null
+  payment_expires_at: string | null
+  customer_phone: string
 }
 
-/**
- * Derives the timestamp of the most recent STK push attempt from payment_expires_at
- * (which is set to initiated_at + 120s in PostgreSQL), ensuring resends get a full
- * grace period across all serverless workers.
- */
-function resolveLastStkInitiatedIso(
-  paymentExpiresAt: string | null | undefined,
+export interface CheckOrderPaymentResult {
+  success: boolean
+  order?: CustomerOrderStatusSnapshot
+  gatewayMessage?: string
+  rateLimited?: boolean
+  error?: string
+}
+
+function getOrderInitiatedIso(
+  paymentExpiresAt: string | null,
   createdAt: string
 ): string {
-  if (paymentExpiresAt) {
-    const expiresMs = Date.parse(paymentExpiresAt)
-    if (Number.isFinite(expiresMs)) {
-      return new Date(expiresMs - 120 * 1000).toISOString()
-    }
+  const expiresMs = paymentExpiresAt ? Date.parse(paymentExpiresAt) : NaN
+  if (Number.isFinite(expiresMs)) {
+    return new Date(expiresMs - 120_000).toISOString()
   }
   return createdAt
 }
@@ -48,179 +54,229 @@ function resolveLastStkInitiatedIso(
 export async function checkCustomerOrderPaymentStatus(
   orderId: string,
   forceDarajaQuery = false
-) {
-  if (!isValidUuid(orderId)) {
-    return { error: 'Invalid order identifier.' }
-  }
-
-  const supabase = await createClient()
+): Promise<CheckOrderPaymentResult> {
+  const supabase = await createServerSupabaseClient()
+  const adminSupabase = createServiceRoleSupabaseClient()
   const storeId = getStoreId()
 
-  const { data: order, error: fetchError } = await supabase
+  const { data: order, error } = await supabase
     .from('orders')
     .select(
-      'id, order_number, payment_status, order_status, mpesa_receipt_number, mpesa_result_desc, mpesa_checkout_request_id, payment_expires_at, customer_phone, total_amount, created_at'
+      'id, order_number, payment_status, order_status, mpesa_checkout_request_id, mpesa_receipt_number, mpesa_result_desc, payment_expires_at, created_at, customer_phone'
     )
     .eq('id', orderId)
     .eq('store_id', storeId)
-    .maybeSingle()
+    .single()
 
-  if (fetchError || !order) {
-    return { error: 'Order not found.' }
+  if (error || !order) {
+    return { success: false, error: 'Order not found.' }
   }
 
-  // 1. If already paid, failed, or cancelled in DB, return immediately without calling Daraja
-  if (
-    order.payment_status === 'paid' ||
-    order.payment_status === 'failed' ||
-    order.order_status === 'cancelled'
-  ) {
-    return { order }
+  const snapshot: CustomerOrderStatusSnapshot = {
+    id: order.id,
+    order_number: order.order_number,
+    payment_status: order.payment_status as 'pending' | 'paid' | 'failed',
+    order_status: order.order_status,
+    mpesa_checkout_request_id: order.mpesa_checkout_request_id,
+    mpesa_receipt_number: order.mpesa_receipt_number,
+    mpesa_result_desc: order.mpesa_result_desc,
+    payment_expires_at: order.payment_expires_at,
+    customer_phone: order.customer_phone,
   }
 
-  // 2. If there is no active Daraja CheckoutRequestID on this order, do not call Daraja or burn rate limits
-  const hasValidCheckoutId =
-    Boolean(order.mpesa_checkout_request_id) &&
-    !order.mpesa_checkout_request_id!.startsWith('RETRY-')
-
-  if (!hasValidCheckoutId) {
+  // If already paid or cancelled in DB (e.g. via instant webhook), return immediately
+  if (order.payment_status === 'paid' || order.order_status === 'cancelled') {
     return {
-      order,
-      gatewayMessage: forceDarajaQuery
-        ? 'No active STK Push session was found for this order. Click "Resend M-Pesa Prompt" to trigger a new pop-up.'
-        : undefined,
+      success: true,
+      order: snapshot,
+      gatewayMessage: order.mpesa_result_desc || undefined,
     }
   }
 
-  // 3. Background polls check Supabase every 10s, and run an automatic Daraja
-  // reconciliation query at +30s, +65s, and +100s if the webhook hasn't arrived yet.
-  if (!forceDarajaQuery) {
-    const lastInitiatedIso = resolveLastStkInitiatedIso(
+  // If DB already recorded a failed/cancelled prompt (e.g. from webhook 1032) and user didn't force a manual check
+  if (order.payment_status === 'failed' && !forceDarajaQuery) {
+    if (order.customer_phone) {
+      clearRateLimit(`stk_phone_${order.customer_phone}`)
+    }
+    return {
+      success: true,
+      order: snapshot,
+      gatewayMessage: order.mpesa_result_desc || undefined,
+    }
+  }
+
+  const checkoutReqId = order.mpesa_checkout_request_id?.trim()
+  if (!checkoutReqId || checkoutReqId.startsWith('RETRY-')) {
+    return {
+      success: true,
+      order: snapshot,
+      gatewayMessage: order.mpesa_result_desc || undefined,
+    }
+  }
+
+  if (forceDarajaQuery) {
+    const rate = checkRateLimit(`manual-stk-query:${orderId}`, {
+      maxRequests: 5,
+      windowMs: 60_000,
+      minIntervalMs: 6_000,
+    })
+    if (!rate.allowed) {
+      return {
+        success: true,
+        order: snapshot,
+        gatewayMessage: `Please wait ${rate.retryAfterSeconds}s before checking again.`,
+        rateLimited: true,
+      }
+    }
+  } else {
+    const initiatedIso = getOrderInitiatedIso(
       order.payment_expires_at,
       order.created_at
     )
-    const shouldAutoQuery = shouldRunScheduledDarajaQuery(
-      order.id,
-      lastInitiatedIso,
-      30000,
-      35000
-    )
-    if (!shouldAutoQuery) {
-      return { order }
+    if (
+      order.payment_status !== 'pending' ||
+      !shouldRunScheduledDarajaQuery(order.id, initiatedIso, 12_000, 15_000)
+    ) {
+      return {
+        success: true,
+        order: snapshot,
+        gatewayMessage: order.mpesa_result_desc || undefined,
+      }
     }
   }
-
-  // 4. Rate limit Daraja stkpushquery to at most 1 call every 15 seconds per order
-  const queryLimit = checkRateLimit(`stk_query_${order.id}`, {
-    maxRequests: 5,
-    windowMs: 120 * 1000,
-    minIntervalMs: 15000,
-  })
-
-  if (!queryLimit.allowed) {
-    return {
-      order,
-      gatewayMessage: forceDarajaQuery
-        ? `Please wait ${queryLimit.retryAfterSeconds}s before querying Safaricom again.`
-        : undefined,
-    }
-  }
-
-  recordOrderQueryAttempt(order.id)
-
-  let gatewayMessage: string | undefined
 
   try {
-    const queryResult = await queryDarajaStkStatus(order.mpesa_checkout_request_id!)
-    const state = String(queryResult.state)
-    gatewayMessage = queryResult.description
+    const queryResult = await queryDarajaStkStatus(checkoutReqId)
 
-    const isSuccess = state === 'paid' || state === 'succeeded'
-    const isTerminalFailure =
-      state === 'failed' || state === 'cancelled' || state === 'timed_out'
+    // 1. Payment Succeeded (ResultCode === 0): Confirm order & atomically deduct stock once
+    if (queryResult.state === 'succeeded') {
+      await adminSupabase.rpc('finalize_order_mpesa_payment', {
+        target_order_id: order.id,
+        checkout_req_id: checkoutReqId,
+        result_code: 0,
+        result_desc: queryResult.description || 'Confirmed via Daraja STK Query',
+        receipt_num: queryResult.receiptNumber ?? null,
+        raw_payload: null,
+      })
 
-    if (isSuccess) {
-      const { data: finalizedId, error: rpcError } = await supabase.rpc(
-        'finalize_order_mpesa_payment',
-        {
-          target_order_id: order.id,
-          checkout_req_id: order.mpesa_checkout_request_id,
-          result_code: 0,
-          result_desc: queryResult.description,
-          receipt_num: null,
-        }
-      )
+      const { data: refreshed } = await adminSupabase
+        .from('orders')
+        .select('mpesa_receipt_number, payment_expires_at')
+        .eq('id', order.id)
+        .maybeSingle()
 
-      if (rpcError || !finalizedId) {
-        console.error(
-          '[Order Finalize RPC Error]:',
-          rpcError?.message || 'Order not updated'
-        )
-      }
-
-      revalidatePath(`/orders/${orderId}`)
+      revalidatePath(`/orders/${order.id}`)
       revalidatePath('/orders')
-      revalidatePath('/dashboard')
       revalidatePath('/inventory')
-    } else if (isTerminalFailure) {
-      const { data: finalizedId, error: rpcError } = await supabase.rpc(
-        'finalize_order_mpesa_payment',
-        {
-          target_order_id: order.id,
-          checkout_req_id: order.mpesa_checkout_request_id,
-          result_code: Number(queryResult.resultCode) || 1,
-          result_desc: queryResult.description,
-          receipt_num: null,
-        }
-      )
+      revalidatePath('/shop')
 
-      if (rpcError || !finalizedId) {
-        console.error(
-          '[Order Fail RPC Error]:',
-          rpcError?.message || 'Order not updated'
-        )
+      return {
+        success: true,
+        order: {
+          ...snapshot,
+          payment_status: 'paid',
+          order_status: 'confirmed',
+          mpesa_receipt_number:
+            refreshed?.mpesa_receipt_number ||
+            queryResult.receiptNumber ||
+            order.mpesa_receipt_number,
+          mpesa_result_desc: queryResult.description,
+          payment_expires_at: refreshed?.payment_expires_at || new Date().toISOString(),
+        },
+        gatewayMessage: 'M-Pesa payment verified and order confirmed!',
+      }
+    }
+
+    // 2. Customer Cancelled Prompt on Phone (1032), Timed Out (1037), or Failed (1 / 2001):
+    //    Immediately stop timer, release phone rate-limit cooldown, and DO NOT deduct stock
+    if (
+      queryResult.state === 'cancelled' ||
+      queryResult.state === 'failed' ||
+      queryResult.state === 'timed_out'
+    ) {
+      const numericCode =
+        queryResult.state === 'cancelled'
+          ? 1032
+          : Number(queryResult.resultCode) || 1
+      const expiredNowIso = new Date().toISOString()
+
+      await adminSupabase.rpc('finalize_order_mpesa_payment', {
+        target_order_id: order.id,
+        checkout_req_id: checkoutReqId,
+        result_code: numericCode,
+        result_desc: queryResult.description,
+        receipt_num: null,
+        raw_payload: null,
+      })
+
+      // Ensure payment_expires_at is immediately expired in DB so countdown stops at 0:00
+      await adminSupabase
+        .from('orders')
+        .update({ payment_expires_at: expiredNowIso })
+        .eq('id', order.id)
+
+      if (order.customer_phone) {
+        clearRateLimit(`stk_phone_${order.customer_phone}`)
       }
 
-      revalidatePath(`/orders/${orderId}`)
+      revalidatePath(`/orders/${order.id}`)
       revalidatePath('/orders')
+
+      return {
+        success: true,
+        order: {
+          ...snapshot,
+          payment_status: 'failed',
+          mpesa_result_desc: queryResult.description,
+          payment_expires_at: expiredNowIso,
+        },
+        gatewayMessage: queryResult.description,
+      }
+    }
+
+    // 3. Still Pending on Handset (or rate_limited / upstream_error)
+    return {
+      success: true,
+      order: snapshot,
+      gatewayMessage: queryResult.description,
     }
   } catch (err) {
-    gatewayMessage =
-      err instanceof Error
-        ? err.message
-        : 'Safaricom Daraja query timed out. Try again in a few seconds.'
+    return {
+      success: true,
+      order: snapshot,
+      gatewayMessage:
+        err instanceof Error
+          ? err.message
+          : 'Waiting for Safaricom M-Pesa confirmation...',
+    }
   }
-
-  const { data: refreshed } = await supabase
-    .from('orders')
-    .select(
-      'id, order_number, payment_status, order_status, mpesa_receipt_number, mpesa_result_desc, mpesa_checkout_request_id, payment_expires_at, customer_phone, total_amount, created_at'
-    )
-    .eq('id', orderId)
-    .eq('store_id', storeId)
-    .maybeSingle()
-
-  return { order: refreshed || order, gatewayMessage }
 }
 
-export async function resendCustomerStkPush(orderId: string, newPhone?: string) {
-  if (!isValidUuid(orderId)) {
-    return { error: 'Invalid order identifier.' }
-  }
-
-  const supabase = await createClient()
+export async function resendCustomerStkPush(
+  orderId: string,
+  newPhone?: string
+): Promise<{
+  success?: boolean
+  payment_expires_at?: string
+  customer_phone?: string
+  checkoutRequestId?: string
+  message?: string
+  error?: string
+}> {
+  const supabase = await createServerSupabaseClient()
+  const adminSupabase = createServiceRoleSupabaseClient()
   const storeId = getStoreId()
 
-  const { data: order } = await supabase
+  const { data: order, error } = await supabase
     .from('orders')
     .select(
-      'id, order_number, customer_phone, total_amount, payment_status, order_status, payment_expires_at, mpesa_checkout_request_id, mpesa_merchant_request_id'
+      'id, order_number, total_amount, customer_phone, payment_status, order_status'
     )
     .eq('id', orderId)
     .eq('store_id', storeId)
-    .maybeSingle()
+    .single()
 
-  if (!order) {
+  if (error || !order) {
     return { error: 'Order not found.' }
   }
 
@@ -228,129 +284,89 @@ export async function resendCustomerStkPush(orderId: string, newPhone?: string) 
     return { error: 'This order has already been paid.' }
   }
 
-  if (order.order_status === 'dispatched' || order.order_status === 'delivered') {
-    return { error: `This order is already ${order.order_status}.` }
-  }
-
-  let phoneToUse = order.customer_phone
-  if (newPhone && newPhone.trim() !== '') {
-    try {
-      phoneToUse = normalizeKenyanPhone(newPhone)
-    } catch (err) {
-      return {
-        error: err instanceof Error ? err.message : 'Invalid M-Pesa phone number.',
-      }
+  let normalizedPhone: string
+  try {
+    normalizedPhone = normalizeKenyanPhone(newPhone || order.customer_phone)
+  } catch (err) {
+    return {
+      error: err instanceof Error ? err.message : 'Enter a valid Kenyan M-Pesa phone number.',
     }
   }
 
-  // Phase 1: Check cooldown BEFORE calling Daraja so we don't collide with an open USSD session
-  const rateCheck = canProceedRateLimit(`stk_phone_${phoneToUse}`, {
-    maxRequests: 4,
+  const rateCheck = canProceedRateLimit(`stk_phone_${normalizedPhone}`, {
+    maxRequests: 5,
     windowMs: 5 * 60 * 1000,
-    minIntervalMs: 35 * 1000,
+    minIntervalMs: 15 * 1000,
   })
 
   if (!rateCheck.allowed) {
     return {
-      error: `Please wait ${rateCheck.retryAfterSeconds}s before requesting another M-Pesa prompt on +${phoneToUse} (Safaricom USSD session lock cooldown).`,
+      error: `Please wait ${rateCheck.retryAfterSeconds}s before sending another M-Pesa prompt to +${normalizedPhone}.`,
     }
   }
 
   try {
-    const stk = await initiateDarajaStkPush({
-      phone: phoneToUse,
+    const stkResponse = await initiateDarajaStkPush({
+      phone: normalizedPhone,
       amount: Number(order.total_amount),
       orderNumber: order.order_number,
-      description: 'OrderRetry',
+      description: 'LuminousDrip',
     })
 
-    // Phase 2: Commit rate limit ONLY after Daraja accepts the push
-    commitRateLimit(`stk_phone_${phoneToUse}`, 5 * 60 * 1000)
+    commitRateLimit(`stk_phone_${normalizedPhone}`, 5 * 60 * 1000)
     markStkPushInitiated(order.id)
 
     const newExpiresAt = new Date(Date.now() + 120 * 1000).toISOString()
 
-    const { data: attachedOk, error: rpcError } = await supabase.rpc(
-      'attach_order_stk_request',
-      {
-        target_order_id: order.id,
-        target_store_id: storeId,
-        checkout_req_id: stk.CheckoutRequestID,
-        merchant_req_id: stk.MerchantRequestID,
-        result_desc: stk.CustomerMessage,
-        updated_phone: phoneToUse,
-      }
-    )
+    await adminSupabase.rpc('attach_order_stk_request', {
+      target_order_id: order.id,
+      target_store_id: storeId,
+      checkout_req_id: stkResponse.CheckoutRequestID,
+      merchant_req_id: stkResponse.MerchantRequestID,
+      result_desc: stkResponse.CustomerMessage,
+      updated_phone: normalizedPhone,
+    })
 
-    if (rpcError || attachedOk === false) {
-      return {
-        error: `STK Push sent, but failed to update order record: ${
-          rpcError?.message || 'Order row could not be locked'
-        }`,
-      }
-    }
-
-    revalidatePath(`/orders/${orderId}`)
+    revalidatePath(`/orders/${order.id}`)
     revalidatePath('/orders')
 
     return {
       success: true,
-      checkoutRequestId: stk.CheckoutRequestID,
-      message: `Fresh STK Push sent to +${phoneToUse}. Keep your phone screen unlocked!`,
       payment_expires_at: newExpiresAt,
-      customer_phone: phoneToUse,
+      customer_phone: normalizedPhone,
+      checkoutRequestId: stkResponse.CheckoutRequestID,
+      message: `New M-Pesa prompt sent to +${normalizedPhone}. Check your phone to enter your PIN.`,
     }
   } catch (err) {
     const errMsg =
-      err instanceof Error
-        ? err.message
-        : 'Could not reach Safaricom Daraja. Please verify your Daraja API keys.'
+      err instanceof Error ? err.message : 'Failed to dispatch M-Pesa STK prompt.'
 
-    // Preserve any existing CheckoutRequestID so an in-flight STK session is never overwritten with null
-    await supabase.rpc('attach_order_stk_request', {
+    await adminSupabase.rpc('attach_order_stk_request', {
       target_order_id: order.id,
       target_store_id: storeId,
-      checkout_req_id: order.mpesa_checkout_request_id || null,
-      merchant_req_id: order.mpesa_merchant_request_id || null,
-      result_desc: order.mpesa_checkout_request_id
-        ? `Retry note: ${errMsg}`
-        : `STK Error: ${errMsg}`,
-      updated_phone: phoneToUse,
+      checkout_req_id: null,
+      merchant_req_id: null,
+      result_desc: `STK Error: ${errMsg}`,
+      updated_phone: normalizedPhone,
     })
 
-    revalidatePath(`/orders/${orderId}`)
     return {
+      customer_phone: normalizedPhone,
       error: errMsg,
-      payment_expires_at: order.payment_expires_at || undefined,
-      customer_phone: phoneToUse,
     }
   }
 }
 
-export async function submitCustomerMpesaReceiptCode(
-  orderId: string,
-  receiptCode: string
-) {
-  if (!isValidUuid(orderId)) {
-    return { error: 'Invalid order identifier.' }
-  }
-
-  const cleaned = (receiptCode || '').trim().toUpperCase().replace(/[^A-Z0-9]/g, '')
-  if (!MPESA_RECEIPT_REGEX.test(cleaned)) {
-    return {
-      error:
-        'Enter a valid 10-character M-Pesa transaction code from your SMS (e.g., SJK8912XYZ).',
-    }
-  }
-
-  const supabase = await createClient()
+export async function cancelCustomerPendingOrder(
+  orderId: string
+): Promise<{ success?: boolean; error?: string }> {
+  const supabase = await createServerSupabaseClient()
+  const adminSupabase = createServiceRoleSupabaseClient()
   const storeId = getStoreId()
 
   const { data: order } = await supabase
     .from('orders')
-    .select(
-      'id, mpesa_checkout_request_id, payment_status, order_status, mpesa_receipt_number'
-    )
+    .select('id, payment_status, customer_phone')
     .eq('id', orderId)
     .eq('store_id', storeId)
     .maybeSingle()
@@ -360,81 +376,136 @@ export async function submitCustomerMpesaReceiptCode(
   }
 
   if (order.payment_status === 'paid') {
-    return { success: true, receipt: order.mpesa_receipt_number || cleaned }
+    return { error: 'This order is already paid and confirmed.' }
   }
 
-  if (order.order_status === 'cancelled') {
-    return {
-      error:
-        'This order was cancelled. Please place a new order from your checkout page.',
-    }
-  }
-
-  // Prevent duplicate M-Pesa receipt code reuse across orders
-  const { data: duplicateOrder } = await supabase
-    .from('orders')
-    .select('id')
-    .eq('store_id', storeId)
-    .eq('mpesa_receipt_number', cleaned)
-    .neq('id', orderId)
-    .maybeSingle()
-
-  if (duplicateOrder) {
-    return {
-      error: `M-Pesa receipt code ${cleaned} has already been used on another order.`,
-    }
-  }
-
-  const { data: finalizedId, error: rpcError } = await supabase.rpc(
-    'finalize_order_mpesa_payment',
+  const { data: cancelledOk, error: rpcError } = await adminSupabase.rpc(
+    'customer_cancel_pending_order',
     {
-      target_order_id: order.id,
-      checkout_req_id: order.mpesa_checkout_request_id,
-      result_code: 0,
-      result_desc: `Customer submitted M-Pesa Receipt Code (${cleaned})`,
-      receipt_num: cleaned,
+      target_order_id: orderId,
+      target_store_id: storeId,
     }
   )
 
-  if (rpcError || !finalizedId) {
+  if (rpcError || !cancelledOk) {
     return {
-      error: `Could not verify receipt code: ${
-        rpcError?.message || 'Order update failed'
-      }`,
+      error: rpcError?.message || 'Unable to cancel this order.',
     }
+  }
+
+  // Ensure payment_expires_at is immediately expired and phone cooldown is cleared
+  await adminSupabase
+    .from('orders')
+    .update({ payment_expires_at: new Date().toISOString() })
+    .eq('id', orderId)
+
+  if (order.customer_phone) {
+    clearRateLimit(`stk_phone_${order.customer_phone}`)
   }
 
   revalidatePath(`/orders/${orderId}`)
   revalidatePath('/orders')
-  revalidatePath('/dashboard')
-  revalidatePath('/inventory')
+
+  return { success: true }
+}
+
+export async function submitCustomerMpesaReceiptCode(
+  orderId: string,
+  receiptCode: string
+): Promise<{
+  success: boolean
+  receipt?: string
+  verifiedImmediately?: boolean
+  message?: string
+  error?: string
+}> {
+  const cleanCode = receiptCode.replace(/[^a-zA-Z0-9]/g, '').toUpperCase()
+  if (cleanCode.length < 10 || cleanCode.length > 12) {
+    return {
+      success: false,
+      error: 'Please enter a valid 10-character M-Pesa transaction code (e.g., SJK8912XYZ).',
+    }
+  }
+
+  const supabase = await createServerSupabaseClient()
+  const adminSupabase = createServiceRoleSupabaseClient()
+  const storeId = getStoreId()
+
+  const { data: order } = await supabase
+    .from('orders')
+    .select('id, mpesa_checkout_request_id, payment_status')
+    .eq('id', orderId)
+    .eq('store_id', storeId)
+    .single()
+
+  if (!order) {
+    return { success: false, error: 'Order not found.' }
+  }
+
+  // Prevent duplicate receipt usage across orders
+  const { data: existingWithReceipt } = await adminSupabase
+    .from('orders')
+    .select('id')
+    .eq('mpesa_receipt_number', cleanCode)
+    .neq('id', orderId)
+    .maybeSingle()
+
+  if (existingWithReceipt) {
+    return {
+      success: false,
+      error: 'This M-Pesa receipt code has already been used on another order.',
+    }
+  }
+
+  // 1. If an active CheckoutRequestID exists, query Daraja to verify if the STK push succeeded
+  if (order.mpesa_checkout_request_id) {
+    try {
+      const queryResult = await queryDarajaStkStatus(order.mpesa_checkout_request_id)
+      if (queryResult.state === 'succeeded') {
+        await adminSupabase.rpc('finalize_order_mpesa_payment', {
+          target_order_id: order.id,
+          checkout_req_id: order.mpesa_checkout_request_id,
+          result_code: 0,
+          result_desc: `Verified via Daraja STK Query with customer receipt ${cleanCode}`,
+          receipt_num: cleanCode,
+          raw_payload: null,
+        })
+        revalidatePath(`/orders/${orderId}`)
+        revalidatePath('/orders')
+        revalidatePath('/inventory')
+        return {
+          success: true,
+          receipt: cleanCode,
+          verifiedImmediately: true,
+          message: 'Payment confirmed with Safaricom M-Pesa!',
+        }
+      }
+    } catch {
+      // Fall through to safe manual receipt logging
+    }
+  }
+
+  // 2. Record the receipt code for verification without deducting stock until confirmed
+  const { error: updateError } = await adminSupabase
+    .from('orders')
+    .update({
+      mpesa_receipt_number: cleanCode,
+      mpesa_result_desc: `Customer submitted M-Pesa receipt ${cleanCode} (Awaiting verification)`,
+    })
+    .eq('id', orderId)
+    .eq('store_id', storeId)
+
+  if (updateError) {
+    return { success: false, error: updateError.message }
+  }
+
+  revalidatePath(`/orders/${orderId}`)
+  revalidatePath('/orders')
 
   return {
     success: true,
-    receipt: cleaned,
+    receipt: cleanCode,
+    verifiedImmediately: false,
+    message: `Receipt ${cleanCode} submitted! An administrator will verify and confirm your order shortly.`,
   }
-}
-
-export async function cancelCustomerPendingOrder(orderId: string) {
-  if (!isValidUuid(orderId)) {
-    return { error: 'Invalid order identifier.' }
-  }
-
-  const supabase = await createClient()
-  const storeId = getStoreId()
-
-  const { data: ok, error } = await supabase.rpc('customer_cancel_pending_order', {
-    target_order_id: orderId,
-    target_store_id: storeId,
-  })
-
-  if (error || !ok) {
-    return {
-      error: 'Could not cancel this order (it may already be paid or processed).',
-    }
-  }
-
-  revalidatePath(`/orders/${orderId}`)
-  revalidatePath('/orders')
-  return { success: true }
 }

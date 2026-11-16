@@ -1,9 +1,24 @@
 import { NextResponse } from 'next/server'
-import { createClient } from '@supabase/supabase-js'
-import { getStoreId } from '@/lib/supabase/config'
+import { createServiceRoleSupabaseClient } from '@/lib/supabase/server'
+import { clearRateLimit } from '@/lib/rate-limit'
+
+interface CallbackMetadataItem {
+  Name: string
+  Value?: string | number
+}
 
 export async function POST(request: Request) {
   try {
+    const expectedSecret = process.env.MPESA_WEBHOOK_SECRET?.trim()
+    if (expectedSecret) {
+      const url = new URL(request.url)
+      const providedSecret = url.searchParams.get('secret')
+      if (providedSecret !== expectedSecret) {
+        console.warn('[Daraja Webhook] Rejected unauthorized callback request')
+        return NextResponse.json({ ResultCode: 0, ResultDesc: 'Accepted' })
+      }
+    }
+
     const payload = await request.json()
     const stkCallback = payload?.Body?.stkCallback
 
@@ -16,97 +31,91 @@ export async function POST(request: Request) {
     const merchantRequestId = stkCallback.MerchantRequestID
       ? String(stkCallback.MerchantRequestID).trim()
       : null
-    const resultCode = Number(stkCallback.ResultCode)
-    const resultDesc = String(stkCallback.ResultDesc || 'Processed')
+    const resultCode = Number(stkCallback.ResultCode ?? -1)
+    const rawDesc = String(stkCallback.ResultDesc || 'Processed by Safaricom Daraja').trim()
+    const resultDesc =
+      resultCode === 1032 && !rawDesc.includes('1032')
+        ? `Code 1032: ${rawDesc}`
+        : rawDesc
 
-    let receiptNumber: string | null = null
+    let mpesaReceiptNumber: string | null = null
     let callbackAmount: number | null = null
 
-    if (resultCode === 0) {
-      const items: Array<{ Name: string; Value?: string | number }> =
-        stkCallback.CallbackMetadata?.Item || []
-      const receiptItem = items.find((i) => i.Name === 'MpesaReceiptNumber')
-      const amountItem = items.find((i) => i.Name === 'Amount')
+    const metadataItems: CallbackMetadataItem[] =
+      stkCallback.CallbackMetadata?.Item || []
 
-      receiptNumber = receiptItem?.Value ? String(receiptItem.Value).trim() : null
-      callbackAmount = amountItem?.Value !== undefined ? Number(amountItem.Value) : null
-
-      if (
-        process.env.MPESA_ENV === 'production' &&
-        (!receiptNumber || receiptNumber.startsWith('SBX'))
-      ) {
-        console.error('[Daraja Webhook Security] Rejected callback without valid MpesaReceiptNumber')
-        return NextResponse.json({ ResultCode: 0, ResultDesc: 'Rejected' })
+    for (const item of metadataItems) {
+      if (item.Name === 'MpesaReceiptNumber' && item.Value) {
+        mpesaReceiptNumber = String(item.Value).trim().toUpperCase()
+      } else if (item.Name === 'Amount' && item.Value !== undefined) {
+        callbackAmount = Number(item.Value)
       }
     }
 
-    const storeId = getStoreId()
-    const supabase = createClient(
-      process.env.NEXT_PUBLIC_SUPABASE_URL!,
-      process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!,
-      {
-        global: {
-          headers: {
-            'x-store-id': storeId,
-          },
-        },
-      }
-    )
+    const supabase = createServiceRoleSupabaseClient()
 
-    // Correlate CheckoutRequestID (and MerchantRequestID if present) against orders
     const { data: matchedOrder } = await supabase
       .from('orders')
-      .select('id, order_number, total_amount, mpesa_merchant_request_id, payment_status')
+      .select(
+        'id, order_number, total_amount, mpesa_merchant_request_id, payment_status, customer_phone'
+      )
       .eq('mpesa_checkout_request_id', checkoutRequestId)
       .maybeSingle()
 
-    if (!matchedOrder) {
-      console.warn(
-        `[Daraja Webhook] No order matched CheckoutRequestID: ${checkoutRequestId}`
-      )
-      return NextResponse.json({ ResultCode: 0, ResultDesc: 'Accepted' })
-    }
+    if (matchedOrder) {
+      if (
+        matchedOrder.mpesa_merchant_request_id &&
+        merchantRequestId &&
+        matchedOrder.mpesa_merchant_request_id !== merchantRequestId
+      ) {
+        console.error(
+          `[Daraja Webhook] MerchantRequestID mismatch for order ${matchedOrder.order_number}`
+        )
+        return NextResponse.json({ ResultCode: 0, ResultDesc: 'Accepted' })
+      }
 
-    if (
-      merchantRequestId &&
-      matchedOrder.mpesa_merchant_request_id &&
-      matchedOrder.mpesa_merchant_request_id !== merchantRequestId
-    ) {
-      console.error(
-        `[Daraja Webhook Mismatch] MerchantRequestID mismatch for ${checkoutRequestId}`
-      )
-      return NextResponse.json({ ResultCode: 0, ResultDesc: 'Rejected' })
-    }
-
-    if (
-      process.env.MPESA_ENV === 'production' &&
-      resultCode === 0 &&
-      callbackAmount !== null &&
-      Math.round(callbackAmount) < Math.round(Number(matchedOrder.total_amount))
-    ) {
-      console.error(
-        `[Daraja Webhook Amount Mismatch] Expected KES ${matchedOrder.total_amount}, got KES ${callbackAmount}`
-      )
-      return NextResponse.json({ ResultCode: 0, ResultDesc: 'Rejected' })
+      if (
+        resultCode === 0 &&
+        callbackAmount !== null &&
+        process.env.MPESA_ENV === 'production' &&
+        callbackAmount + 1 < Number(matchedOrder.total_amount)
+      ) {
+        console.error(
+          `[Daraja Webhook] Amount mismatch on order ${matchedOrder.order_number}: expected ${matchedOrder.total_amount}, got ${callbackAmount}`
+        )
+        return NextResponse.json({ ResultCode: 0, ResultDesc: 'Accepted' })
+      }
     }
 
     const { data: finalizedOrderId, error: rpcError } = await supabase.rpc(
       'finalize_order_mpesa_payment',
       {
-        target_order_id: matchedOrder.id,
+        target_order_id: matchedOrder?.id ?? null,
         checkout_req_id: checkoutRequestId,
         result_code: resultCode,
         result_desc: resultDesc,
-        receipt_num: receiptNumber,
+        receipt_num: mpesaReceiptNumber,
         raw_payload: payload,
       }
     )
 
+    // Immediately zero out payment_expires_at when cancelled/failed so UI timer stops instantaneously
+    if (resultCode !== 0 && (matchedOrder?.id || finalizedOrderId)) {
+      await supabase
+        .from('orders')
+        .update({ payment_expires_at: new Date().toISOString() })
+        .eq('id', matchedOrder?.id || finalizedOrderId)
+
+      if (matchedOrder?.customer_phone) {
+        clearRateLimit(`stk_phone_${matchedOrder.customer_phone}`)
+      }
+    }
+
     if (rpcError) {
-      console.error('[Daraja Webhook RPC Error]:', rpcError.message)
+      console.error('[Daraja Webhook] RPC finalize_order_mpesa_payment failed:', rpcError)
     } else {
       console.info(
-        `[Daraja Webhook Processed] Order #${matchedOrder.order_number} (${finalizedOrderId}) | ResultCode: ${resultCode} | Receipt: ${receiptNumber || 'N/A'}`
+        `[Daraja Webhook] Reconciled CheckoutRequestID=${checkoutRequestId} (ResultCode=${resultCode}, OrderID=${finalizedOrderId})`
       )
     }
 

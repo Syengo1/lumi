@@ -47,7 +47,7 @@ export function getDarajaBackoffRemainingSeconds(): number {
   return remainingMs > 0 ? Math.ceil(remainingMs / 1000) : 0
 }
 
-async function paceDarajaRequest(minGapMs = 2200): Promise<void> {
+async function paceDarajaRequest(minGapMs = 2000): Promise<void> {
   const cache = getDarajaCache()
   const previousQueue =
     cache.apiQueuePromise && typeof cache.apiQueuePromise.then === 'function'
@@ -70,6 +70,7 @@ async function paceDarajaRequest(minGapMs = 2200): Promise<void> {
 
 export function normalizeKenyanPhone(phone: string): string {
   const digits = phone.replace(/\D/g, '')
+
   if (digits.startsWith('07') && digits.length === 10) {
     return `254${digits.slice(1)}`
   }
@@ -82,6 +83,7 @@ export function normalizeKenyanPhone(phone: string): string {
   if (digits.startsWith('254') && digits.length === 12) {
     return digits
   }
+
   throw new Error(
     'Enter a valid Kenyan M-Pesa phone number (e.g., 0712 345 678 or 0114 513 647).'
   )
@@ -135,8 +137,7 @@ export async function getDarajaAccessToken(forceRefresh = false): Promise<string
 
   cache.inFlightTokenPromise = (async () => {
     try {
-      await paceDarajaRequest(1500)
-
+      await paceDarajaRequest(1200)
       const response = await fetch(
         `${baseUrl}/oauth/v1/generate?grant_type=client_credentials`,
         {
@@ -218,14 +219,15 @@ export async function initiateDarajaStkPush({
 }: InitiateStkPushParams): Promise<StkPushResponse> {
   const { env, baseUrl } = getDarajaEnvConfig()
   const formattedPhone = normalizeKenyanPhone(phone)
+
   const shortcode = (process.env.MPESA_SHORTCODE || '174379').trim()
   const partyB = (process.env.MPESA_PARTY_B || shortcode).trim()
   const passkey = (
     process.env.MPESA_PASSKEY ||
     'bfb279f9aa9bdbcf158e97dd71a467cd2e0c893059b10f78e6b72ada1ed2c919'
   ).trim()
-
   const callbackUrl = resolveValidCallbackUrl()
+
   const transactionType =
     process.env.MPESA_TRANSACTION_TYPE === 'CustomerBuyGoodsOnline'
       ? 'CustomerBuyGoodsOnline'
@@ -236,7 +238,6 @@ export async function initiateDarajaStkPush({
   const cleanDesc =
     description.replace(/[^a-zA-Z0-9]/g, '').slice(0, 12) || 'OrderPay'
 
-  // Always send the exact order total unless MPESA_SANDBOX_FORCE_ONE_KES='true' is explicitly set
   const forceOneKesInSandbox =
     env === 'sandbox' && process.env.MPESA_SANDBOX_FORCE_ONE_KES === 'true'
   const billedAmount = forceOneKesInSandbox
@@ -244,7 +245,7 @@ export async function initiateDarajaStkPush({
     : Math.max(1, Math.round(Number(amount) || 1))
 
   const token = await getDarajaAccessToken()
-  await paceDarajaRequest(2200)
+  await paceDarajaRequest(2000)
 
   const timestamp = getDarajaTimestamp()
   const password = Buffer.from(`${shortcode}${passkey}${timestamp}`).toString('base64')
@@ -312,6 +313,7 @@ export interface NormalizedDarajaQueryResult {
   httpStatus: number
   resultCode: string | null
   description: string
+  receiptNumber: string | null
 }
 
 export async function queryDarajaStkStatus(
@@ -323,7 +325,8 @@ export async function queryDarajaStkStatus(
       state: 'rate_limited',
       httpStatus: 429,
       resultCode: '429',
-      description: `Safaricom query rate limit active. Please wait ${backoffSecs}s (or await automatic webhook confirmation).`,
+      description: `Safaricom query rate limit active. Please wait ${backoffSecs}s.`,
+      receiptNumber: null,
     }
   }
 
@@ -335,7 +338,7 @@ export async function queryDarajaStkStatus(
   ).trim()
 
   const token = await getDarajaAccessToken()
-  await paceDarajaRequest(2500)
+  await paceDarajaRequest(2200)
 
   const timestamp = getDarajaTimestamp()
   const password = Buffer.from(`${shortcode}${passkey}${timestamp}`).toString('base64')
@@ -373,57 +376,82 @@ export async function queryDarajaStkStatus(
 
   console.info(`[Daraja STK Query Response HTTP ${res.status}]`, data)
 
-  // 1. Explicit HTTP 429 Spike Arrest handling with 35s fail-fast circuit breaker
+  // 1. Explicit HTTP 429 Spike Arrest handling with 25s circuit breaker
   const hasSpikeArrest =
     res.status === 429 ||
     Boolean((data.fault as Record<string, unknown> | undefined)?.faultstring)
 
   if (hasSpikeArrest) {
-    getDarajaCache().backoffUntil = Date.now() + 35000
+    getDarajaCache().backoffUntil = Date.now() + 25000
     return {
       state: 'rate_limited',
       httpStatus: res.status,
       resultCode: '429',
       description:
-        'Safaricom query rate limit reached (HTTP 429). Backing off for 35s while awaiting webhook callback.',
+        'Safaricom query rate limit reached. Waiting briefly while listening for instant callback.',
+      receiptNumber: null,
     }
   }
 
-  // 2. Explicit Upstream Error handling (e.g., 500.001.1001 while user is still entering PIN)
+  // 2. Check if transaction is still actively awaiting PIN entry on handset (500.001.1001)
   const errorCode = data.errorCode ? String(data.errorCode) : null
   if (errorCode) {
     const errorMsg = data.errorMessage
       ? String(data.errorMessage)
-      : 'Transaction still being processed on Safaricom switch'
+      : 'The transaction is being processed'
+    if (
+      errorCode === '500.001.1001' ||
+      errorMsg.toLowerCase().includes('being processed')
+    ) {
+      return {
+        state: 'pending',
+        httpStatus: res.status,
+        resultCode: '4999',
+        description:
+          'M-Pesa prompt is active on your handset. Enter your PIN or press Cancel on your phone.',
+        receiptNumber: null,
+      }
+    }
     return {
       state: 'upstream_error',
       httpStatus: res.status,
       resultCode: errorCode,
-      description: `Safaricom switch status (${errorCode}): ${errorMsg}. Complete PIN entry on your handset if prompted.`,
+      description: `Safaricom switch status (${errorCode}): ${errorMsg}.`,
+      receiptNumber: null,
     }
   }
 
   // 3. Definitive Transaction ResultCodes
   const resultCodeStr =
     data.ResultCode !== undefined ? String(data.ResultCode).trim() : null
+  const rawResultDesc = String(data.ResultDesc || '').trim()
+  const extractedReceipt =
+    typeof data.MpesaReceiptNumber === 'string' && data.MpesaReceiptNumber.trim()
+      ? data.MpesaReceiptNumber.trim().toUpperCase()
+      : null
 
   if (resultCodeStr === '0') {
     return {
       state: 'succeeded',
       httpStatus: res.status,
       resultCode: '0',
-      description: String(
-        data.ResultDesc || 'The service request is processed successfully.'
-      ),
+      description: rawResultDesc || 'The service request is processed successfully.',
+      receiptNumber: extractedReceipt,
     }
   }
 
-  if (resultCodeStr === '1032') {
+  if (
+    resultCodeStr === '1032' ||
+    resultCodeStr === '1031' ||
+    rawResultDesc.toLowerCase().includes('cancelled by user') ||
+    rawResultDesc.toLowerCase().includes('cancelled by initiator')
+  ) {
     return {
       state: 'cancelled',
       httpStatus: res.status,
       resultCode: '1032',
-      description: 'Code 1032: Request cancelled by customer on handset.',
+      description: 'Code 1032: M-Pesa payment prompt was cancelled on the phone.',
+      receiptNumber: null,
     }
   }
 
@@ -435,7 +463,8 @@ export async function queryDarajaStkStatus(
       description:
         resultCodeStr === '1037'
           ? 'Code 1037 (DS timeout): Customer handset could not be reached.'
-          : 'Code 1019: Transaction expired before completion.',
+          : 'Code 1019: Transaction expired before PIN entry.',
+      receiptNumber: null,
     }
   }
 
@@ -445,7 +474,8 @@ export async function queryDarajaStkStatus(
       httpStatus: res.status,
       resultCode: '1',
       description:
-        'Code 1 (Insufficient Balance): Your M-Pesa wallet balance is lower than the requested order amount.',
+        'Code 1 (Insufficient Balance): Your M-Pesa wallet balance is lower than the order total.',
+      receiptNumber: null,
     }
   }
 
@@ -455,6 +485,7 @@ export async function queryDarajaStkStatus(
       httpStatus: res.status,
       resultCode: '2001',
       description: 'Code 2001: The M-Pesa PIN entered was invalid.',
+      receiptNumber: null,
     }
   }
 
@@ -465,18 +496,18 @@ export async function queryDarajaStkStatus(
       resultCode: '2029',
       description:
         'Code 2029 (Unresolved Reason Type): TransactionType/PartyB mismatch for shortcode.',
+      receiptNumber: null,
     }
   }
 
-  // Any other non-zero ResultCode (except intermediate 4999) is a terminal failure
   if (resultCodeStr && resultCodeStr !== '4999') {
     return {
       state: 'failed',
       httpStatus: res.status,
       resultCode: resultCodeStr,
-      description: String(
-        data.ResultDesc || `Transaction failed (ResultCode ${resultCodeStr}).`
-      ),
+      description:
+        rawResultDesc || `Transaction failed (ResultCode ${resultCodeStr}).`,
+      receiptNumber: null,
     }
   }
 
@@ -484,6 +515,7 @@ export async function queryDarajaStkStatus(
     state: 'pending',
     httpStatus: res.status,
     resultCode: resultCodeStr,
-    description: String(data.ResultDesc || 'Transaction pending completion.'),
+    description: rawResultDesc || 'Transaction pending PIN entry on handset.',
+    receiptNumber: null,
   }
 }

@@ -1,6 +1,6 @@
 'use server'
 
-import { createClient } from '@/lib/supabase/server'
+import { createClient, createServiceRoleSupabaseClient } from '@/lib/supabase/server'
 import { getStoreId } from '@/lib/supabase/config'
 import { queryDarajaStkStatus } from '@/lib/daraja/mpesa'
 import { revalidatePath } from 'next/cache'
@@ -33,6 +33,7 @@ function revalidateOrderPaths(orderId?: string) {
   revalidatePath('/orders')
   revalidatePath('/dashboard')
   revalidatePath('/inventory')
+  revalidatePath('/shop')
   if (orderId) {
     revalidatePath(`/orders/${orderId}`)
   }
@@ -40,6 +41,29 @@ function revalidateOrderPaths(orderId?: string) {
 
 export async function updateOrderStatus(orderId: string, nextStatus: OrderStatus) {
   const { supabase, storeId } = await requireStoreAdmin()
+
+  const { data: existingOrder, error: fetchError } = await supabase
+    .from('orders')
+    .select('id, payment_status, order_status')
+    .eq('id', orderId)
+    .eq('store_id', storeId)
+    .single()
+
+  if (fetchError || !existingOrder) {
+    throw new Error('Order not found.')
+  }
+
+  // Enforce strict rule: Only paid orders can be marked as confirmed, dispatched, or delivered
+  if (
+    (nextStatus === 'confirmed' ||
+      nextStatus === 'dispatched' ||
+      nextStatus === 'delivered') &&
+    existingOrder.payment_status !== 'paid'
+  ) {
+    throw new Error(
+      'Cannot mark an unpaid order as Confirmed, Dispatched, or Delivered. Verify the M-Pesa payment first so stock is properly deducted.'
+    )
+  }
 
   const updatePayload: Record<string, unknown> = {
     order_status: nextStatus,
@@ -49,6 +73,9 @@ export async function updateOrderStatus(orderId: string, nextStatus: OrderStatus
     updatePayload.dispatched_at = new Date().toISOString()
   } else if (nextStatus === 'delivered') {
     updatePayload.delivered_at = new Date().toISOString()
+  } else if (nextStatus === 'cancelled' && existingOrder.payment_status !== 'paid') {
+    updatePayload.payment_status = 'failed'
+    updatePayload.payment_expires_at = new Date().toISOString()
   }
 
   const { error } = await supabase
@@ -66,6 +93,7 @@ export async function updateOrderStatus(orderId: string, nextStatus: OrderStatus
 
 export async function manualVerifyMpesaReceipt(orderId: string, receiptCode: string) {
   const { supabase, storeId } = await requireStoreAdmin()
+  const adminSupabase = createServiceRoleSupabaseClient()
 
   const formattedReceipt = receiptCode.trim().toUpperCase().replace(/[^A-Z0-9]/g, '')
   if (!formattedReceipt || formattedReceipt.length < 6) {
@@ -83,7 +111,7 @@ export async function manualVerifyMpesaReceipt(orderId: string, receiptCode: str
     throw new Error('Order not found.')
   }
 
-  const { data: finalizedId, error: rpcError } = await supabase.rpc(
+  const { data: finalizedId, error: rpcError } = await adminSupabase.rpc(
     'finalize_order_mpesa_payment',
     {
       target_order_id: existingOrder.id,
@@ -91,6 +119,7 @@ export async function manualVerifyMpesaReceipt(orderId: string, receiptCode: str
       result_code: 0,
       result_desc: 'Manually verified by store administrator',
       receipt_num: formattedReceipt,
+      raw_payload: null,
     }
   )
 
@@ -105,6 +134,7 @@ export async function manualVerifyMpesaReceipt(orderId: string, receiptCode: str
 
 export async function syncOrderMpesaStatus(orderId: string) {
   const { supabase, storeId } = await requireStoreAdmin()
+  const adminSupabase = createServiceRoleSupabaseClient()
 
   const { data: order } = await supabase
     .from('orders')
@@ -125,12 +155,13 @@ export async function syncOrderMpesaStatus(orderId: string) {
     const darajaStatus = await queryDarajaStkStatus(order.mpesa_checkout_request_id)
 
     if (darajaStatus.state === 'succeeded') {
-      const { error: rpcError } = await supabase.rpc('finalize_order_mpesa_payment', {
+      const { error: rpcError } = await adminSupabase.rpc('finalize_order_mpesa_payment', {
         target_order_id: order.id,
         checkout_req_id: order.mpesa_checkout_request_id,
         result_code: 0,
         result_desc: darajaStatus.description,
-        receipt_num: null,
+        receipt_num: darajaStatus.receiptNumber ?? null,
+        raw_payload: null,
       })
 
       if (rpcError) {
@@ -138,7 +169,7 @@ export async function syncOrderMpesaStatus(orderId: string) {
       }
 
       revalidateOrderPaths(orderId)
-      return { success: true, message: 'M-Pesa payment confirmed via Daraja!' }
+      return { success: true, message: 'M-Pesa payment confirmed and stock updated!' }
     }
 
     if (
@@ -146,19 +177,19 @@ export async function syncOrderMpesaStatus(orderId: string) {
       darajaStatus.state === 'cancelled' ||
       darajaStatus.state === 'timed_out'
     ) {
-      await supabase.rpc('finalize_order_mpesa_payment', {
+      await adminSupabase.rpc('finalize_order_mpesa_payment', {
         target_order_id: order.id,
         checkout_req_id: order.mpesa_checkout_request_id,
         result_code: Number(darajaStatus.resultCode) || 1,
         result_desc: darajaStatus.description,
         receipt_num: null,
+        raw_payload: null,
       })
 
       revalidateOrderPaths(orderId)
       return { error: darajaStatus.description }
     }
 
-    // For 'pending', 'rate_limited', or 'upstream_error', log the latest status description without failing the order
     await supabase
       .from('orders')
       .update({
